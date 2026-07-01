@@ -1,0 +1,41 @@
+# voicelog configuration
+# All fields are optional — built-in defaults are used for anything not listed here.
+
+# LLM provider settings
+provider: nvidia
+base_url: https://integrate.api.nvidia.com/v1
+model: mistralai/mistral-medium-3.5-128b # any model on build.nvidia.com
+# API key is read from the NVIDIA_API_KEY environment variable — never stored here.
+
+# Sections that will appear in the generated changelog (in this order).
+# Commits are grouped into these sections by the model.
+sections:
+  - Breaking
+  - Features
+  - Fixes
+  - Internal
+
+# Commit subject patterns to drop before sending to the model (regex, case-insensitive).
+noise:
+  - '^wip'
+  - '^merge'
+  - '^fmt'
+  - '^chore\(deps\)'
+
+# Directory containing 1-3 past changelogs (.md or .txt) used as style examples.
+# Missing or empty directory → neutral default tone.
+voice_samples: .changelog/voice/
+
+# Number of commits to use when no prior tag exists in the repo.
+fallback_commits: 50
+
+# --- Speech: the log talks to you (NVIDIA Riva TTS) ---
+# Every run prints the changelog AND reads it aloud. Reuses NVIDIA_API_KEY.
+speak: true
+tts_function_id: 877104f7-e885-42b9-8de8-f6e4c6303969  # magpie-tts-multilingual
+tts_voice: Magpie-Multilingual.EN-US.Sofia
+tts_language: en-US
+tts_sample_rate: 44100
+
+# Persistent casual changelog maintained across releases.
+voice_md: .changelog/voice.md

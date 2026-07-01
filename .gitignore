@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.venv/
+venv/
+
+# Pytest
+.pytest_cache/
+
+# voicelog local cache (per-repo generation cache, not source)
+.changelog/.voicelog-cache.json
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voicelog"
+version = "0.1.0"
+description = "Generate polished release changelogs from git commits in your project's voice"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+voicelog = "voicelog.cli:main"
+
+[project.optional-dependencies]
+tts = ["nvidia-riva-client>=2.14"]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["voicelog*"]

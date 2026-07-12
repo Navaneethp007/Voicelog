@@ -1,16 +1,38 @@
 [build-system]
-requires = ["setuptools>=42"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "voicelog"
-version = "0.1.0"
-description = "Generate polished release changelogs from git commits in your project's voice"
+version = "0.1.1"
+description = "A CLI that gives you a spoken and written rundown of your git changes"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Navaneeth Prabha" }]
+keywords = ["changelog", "git", "release-notes", "tts", "text-to-speech", "cli", "voice", "nvidia"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Version Control :: Git",
+    "Topic :: Utilities",
+]
 dependencies = [
     "httpx>=0.27",
     "PyYAML>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Navaneethp007/voicelog"
+Repository = "https://github.com/Navaneethp007/voicelog"
+Issues = "https://github.com/Navaneethp007/voicelog/issues"
 
 [project.scripts]
 voicelog = "voicelog.cli:main"

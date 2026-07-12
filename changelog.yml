@@ -57,22 +57,49 @@ fallback_commits: 50
 # (keeps generation fast and cheap). The full changelog still covers these.
 max_commits: 50
 
-# --- Speech: the log talks to you (NVIDIA Riva TTS) ---
-# Every run prints the changelog AND reads it aloud.
-# NOTE: speech is NVIDIA Riva only, so it always needs an NVIDIA key — even if
-# your text LLM above is OpenAI/Groq/etc. tts_api_key_env names that env var.
-# If you don't have an NVIDIA key, set `speak: false` (text still works).
+# How many recent commits `--new` reads to orient you on a repo you just
+# cloned (ignores tags entirely — "what's been happening lately").
+onboard_commits: 15
+
+# --- Speech: the log talks to you ---
+# Every run prints the changelog AND reads it aloud. Pick a TTS provider —
+# all three work on Windows/macOS/Linux (playback uses winsound/afplay/aplay).
+# If you don't have a key for any of them, set `speak: false` (text still works).
+#
+#   NVIDIA Riva (default, gRPC):
+#     tts_provider: riva
+#     tts_voice: Magpie-Multilingual.EN-US.Sofia
+#     tts_language: en-US
+#     tts_sample_rate: 44100
+#     tts_function_id: 877104f7-e885-42b9-8de8-f6e4c6303969  # magpie-tts-multilingual
+#     tts_api_key_env: NVIDIA_API_KEY
+#
+#   OpenAI TTS:
+#     tts_provider: openai
+#     tts_model: gpt-4o-mini-tts
+#     tts_voice: alloy      # or: echo, fable, onyx, nova, shimmer
+#     tts_api_key_env: OPENAI_API_KEY
+#
+#   ElevenLabs:
+#     tts_provider: elevenlabs
+#     tts_model: eleven_multilingual_v2
+#     tts_voice: <your ElevenLabs voice id>
+#     tts_api_key_env: ELEVENLABS_API_KEY
+#
 speak: true
+tts_provider: riva
 tts_api_key_env: NVIDIA_API_KEY
 
 # How much the spoken summary says: "brief" (2-3 sentences) or "detailed"
 # (a fuller walkthrough). --detail on the CLI forces detailed for one run.
 speech_detail: brief
-tts_function_id: 877104f7-e885-42b9-8de8-f6e4c6303969  # magpie-tts-multilingual
+tts_function_id: 877104f7-e885-42b9-8de8-f6e4c6303969  # magpie-tts-multilingual (riva only)
 tts_voice: Magpie-Multilingual.EN-US.Sofia
-tts_language: en-US
-tts_sample_rate: 44100
-tts_timeout: 90        # seconds per speech request before giving up (avoids hangs)
+tts_language: en-US               # riva only
+tts_sample_rate: 44100            # riva only (openai/elevenlabs use their own rate)
+tts_model: ""                     # openai/elevenlabs model id (blank = provider default)
+tts_base_url: ""                  # openai-compatible override, e.g. a proxy (blank = api.openai.com)
+tts_timeout: 90                   # seconds per speech request before giving up (avoids hangs)
 
 # By default voicelog gives a transient rundown (print + speak). Set this true
 # (or pass --changelog) to ALSO maintain a persistent release changelog.

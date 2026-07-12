@@ -1,10 +1,20 @@
-"""Text-to-speech — speak a changelog aloud via NVIDIA Riva TTS (cloud gRPC)."""
+"""Text-to-speech — speak a changelog aloud.
+
+Provider-aware: ``tts_provider`` selects the engine (NVIDIA Riva, OpenAI, or
+ElevenLabs). Each adapter returns raw 16-bit PCM; shared code stitches it into
+one WAV and plays it cross-platform (Windows/macOS/Linux).
+"""
 from __future__ import annotations
 
 import os
+import platform
 import re
+import shutil
+import subprocess
 import tempfile
 import wave
+
+import httpx
 
 
 class TTSError(Exception):
@@ -12,30 +22,50 @@ class TTSError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Lazy / patchable import + playback helpers
+# Cross-platform playback
 # ---------------------------------------------------------------------------
 
-def _import_riva():
-    """Import riva.client and AudioEncoding. Kept thin so tests can patch it."""
-    import riva.client
-    from riva.client.proto.riva_audio_pb2 import AudioEncoding
-
-    return riva.client, AudioEncoding
+def _linux_player() -> list[str] | None:
+    for cmd in (["paplay"], ["aplay", "-q"], ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]):
+        if shutil.which(cmd[0]):
+            return cmd
+    return None
 
 
 def _check_playback() -> None:
-    """Ensure audio playback is available (Windows-only) before synthesizing."""
-    try:
-        import winsound  # noqa: F401
-    except ImportError as exc:  # pragma: no cover - non-Windows only
-        raise TTSError("Audio playback only supported on Windows") from exc
+    """Verify an audio player is available before spending an API call."""
+    system = platform.system()
+    if system == "Windows":
+        try:
+            import winsound  # noqa: F401
+        except ImportError as exc:  # pragma: no cover
+            raise TTSError("winsound is unavailable on this Windows build") from exc
+    elif system == "Darwin":
+        if not shutil.which("afplay"):  # pragma: no cover - macOS only
+            raise TTSError("no audio player found ('afplay' missing)")
+    else:
+        if _linux_player() is None:  # pragma: no cover - linux only
+            raise TTSError(
+                "no audio player found — install one of: pulseaudio (paplay), "
+                "alsa-utils (aplay), or ffmpeg (ffplay)"
+            )
 
 
 def _play(path: str) -> None:
-    """Play a WAV file synchronously. Kept thin so tests can patch it."""
-    import winsound
+    """Play a WAV file synchronously on the current OS. Patchable in tests."""
+    system = platform.system()
+    if system == "Windows":
+        import winsound
 
-    winsound.PlaySound(path, winsound.SND_FILENAME)
+        winsound.PlaySound(path, winsound.SND_FILENAME)
+        return
+    if system == "Darwin":
+        subprocess.run(["afplay", path], check=True)
+        return
+    player = _linux_player()
+    if player is None:  # pragma: no cover
+        raise TTSError("no audio player found")
+    subprocess.run([*player, path], check=True)
 
 
 # ---------------------------------------------------------------------------
@@ -102,16 +132,18 @@ def _chunk_text(text: str, max_len: int = 400) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Provider adapters — each returns (pcm_bytes, sample_rate_hz)
 # ---------------------------------------------------------------------------
 
-def speak(text: str, config) -> None:
-    """Speak ``text`` aloud via NVIDIA Riva TTS.
+def _import_riva():
+    """Import riva.client and AudioEncoding. Kept thin so tests can patch it."""
+    import riva.client
+    from riva.client.proto.riva_audio_pb2 import AudioEncoding
 
-    Raises:
-        TTSError: If Riva is unavailable, playback is unsupported, the API key
-                  is missing, or synthesis fails.
-    """
+    return riva.client, AudioEncoding
+
+
+def _synth_riva(chunks: list[str], api_key: str, config) -> tuple[bytes, int]:
     try:
         riva_client, AudioEncoding = _import_riva()
     except ImportError as exc:
@@ -119,28 +151,10 @@ def speak(text: str, config) -> None:
             "Riva TTS not installed — run: pip install voicelog[tts]"
         ) from exc
 
-    # Check playback availability before spending an API call.
-    _check_playback()
-
-    env_name = getattr(config, "tts_api_key_env", "NVIDIA_API_KEY")
-    api_key = os.environ.get(env_name)
-    if not api_key:
-        raise TTSError(
-            f"Set the {env_name} environment variable — NVIDIA Riva TTS needs an "
-            f"NVIDIA API key (see https://build.nvidia.com)."
-        )
-
-    speech = _speech_text(text)
-    if not speech.strip():
-        return
-
-    chunks = _chunk_text(speech, max_len=400)
-    if not chunks:
-        return
-
-    import grpc  # always present when riva.client imported successfully
+    import grpc  # present whenever riva.client imported
 
     timeout = getattr(config, "tts_timeout", 90.0)
+    rate = config.tts_sample_rate
     try:
         auth = riva_client.Auth(
             uri="grpc.nvcf.nvidia.com:443",
@@ -154,14 +168,13 @@ def speak(text: str, config) -> None:
 
         pcm = bytearray()
         for chunk in chunks:
-            # Use the async future path so we can enforce a client-side deadline —
-            # riva's synchronous synthesize() has no timeout and blocks forever if
-            # the hosted model is slow to respond or the stream hangs.
+            # Async future path so we can enforce a client-side deadline — riva's
+            # synchronous synthesize() has no timeout and can block forever.
             call = service.synthesize(
                 chunk,
                 voice_name=config.tts_voice,
                 language_code=config.tts_language,
-                sample_rate_hz=config.tts_sample_rate,
+                sample_rate_hz=rate,
                 encoding=AudioEncoding.LINEAR_PCM,
                 future=True,
             )
@@ -180,16 +193,129 @@ def speak(text: str, config) -> None:
     except Exception as exc:
         raise TTSError(str(exc)) from exc
 
+    return bytes(pcm), rate
+
+
+def _synth_openai(chunks: list[str], api_key: str, config) -> tuple[bytes, int]:
+    base = (getattr(config, "tts_base_url", "") or "https://api.openai.com/v1").rstrip("/")
+    model = getattr(config, "tts_model", "") or "gpt-4o-mini-tts"
+    voice = config.tts_voice or "alloy"
+    timeout = getattr(config, "tts_timeout", 90.0)
+    url = f"{base}/audio/speech"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    pcm = bytearray()
+    for chunk in chunks:
+        try:
+            resp = httpx.post(
+                url,
+                headers=headers,
+                json={"model": model, "voice": voice, "input": chunk, "response_format": "pcm"},
+                timeout=timeout,
+            )
+            if not resp.is_success:
+                raise TTSError(f"OpenAI TTS HTTP {resp.status_code}: {resp.text[:200]}")
+            pcm.extend(resp.content)
+        except TTSError:
+            raise
+        except httpx.HTTPError as exc:
+            raise TTSError(f"OpenAI TTS request failed: {exc}") from exc
+
+    # OpenAI 'pcm' is 24 kHz, 16-bit, mono.
+    return bytes(pcm), 24000
+
+
+def _synth_elevenlabs(chunks: list[str], api_key: str, config) -> tuple[bytes, int]:
+    voice_id = config.tts_voice
+    if not voice_id:
+        raise TTSError("ElevenLabs needs tts_voice set to a voice id")
+    model = getattr(config, "tts_model", "") or "eleven_multilingual_v2"
+    timeout = getattr(config, "tts_timeout", 90.0)
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=pcm_24000"
+    headers = {"xi-api-key": api_key}
+
+    pcm = bytearray()
+    for chunk in chunks:
+        try:
+            resp = httpx.post(
+                url,
+                headers=headers,
+                json={"text": chunk, "model_id": model},
+                timeout=timeout,
+            )
+            if not resp.is_success:
+                raise TTSError(f"ElevenLabs HTTP {resp.status_code}: {resp.text[:200]}")
+            pcm.extend(resp.content)
+        except TTSError:
+            raise
+        except httpx.HTTPError as exc:
+            raise TTSError(f"ElevenLabs request failed: {exc}") from exc
+
+    return bytes(pcm), 24000
+
+
+_ADAPTERS = {
+    "riva": _synth_riva,
+    "openai": _synth_openai,
+    "elevenlabs": _synth_elevenlabs,
+}
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def speak(text: str, config) -> None:
+    """Speak ``text`` aloud using the configured TTS provider.
+
+    Raises:
+        TTSError: unknown provider, missing key, no audio player, or synthesis
+                  failure. (Callers treat this as best-effort — audio never
+                  blocks the text output.)
+    """
+    speech = _speech_text(text)
+    if not speech.strip():
+        return
+    chunks = _chunk_text(speech, max_len=400)
+    if not chunks:
+        return
+
+    provider = getattr(config, "tts_provider", "riva").lower()
+    adapter = _ADAPTERS.get(provider)
+    if adapter is None:
+        raise TTSError(
+            f"unknown tts_provider '{provider}' — use one of: "
+            f"{', '.join(sorted(_ADAPTERS))}"
+        )
+
+    # Fail before spending an API call if we can't play audio here.
+    _check_playback()
+
+    env_name = getattr(config, "tts_api_key_env", "NVIDIA_API_KEY")
+    api_key = os.environ.get(env_name)
+    if not api_key:
+        raise TTSError(
+            f"Set the {env_name} environment variable with your {provider} TTS key."
+        )
+
+    pcm, rate = adapter(chunks, api_key, config)
+    if not pcm:
+        return
+
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     path = tmp.name
     tmp.close()
     try:
         with wave.open(path, "wb") as wav:
             wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(config.tts_sample_rate)
-            wav.writeframes(bytes(pcm))
+            wav.setsampwidth(2)  # 16-bit PCM
+            wav.setframerate(rate)
+            wav.writeframes(pcm)
         _play(path)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        # Playback failure (busy/absent audio device, player vanished, etc.) —
+        # never let this crash the CLI; the text output already succeeded.
+        raise TTSError(f"audio playback failed: {exc}") from exc
     finally:
         try:
             os.remove(path)

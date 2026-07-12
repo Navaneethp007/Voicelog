@@ -7,8 +7,14 @@ def build_prompt(
     commits: list[Commit],
     voice_text: str,
     sections: list[str],
+    diff: str | None = None,
 ) -> list[dict]:
     """Return an OpenAI-format message list for release-note generation.
+
+    ``diff`` is opt-in (see ``gitsource.read_commits(with_diff=True)``): when
+    provided (non-empty), the actual code diff for the range is included so the
+    model can write richer notes even when commit messages are vague. Omitted by
+    default — commit messages + diffstat only, no code sent anywhere.
 
     Returns:
         [{"role": "system", "content": ...}, {"role": "user", "content": ...}]
@@ -29,6 +35,12 @@ def build_prompt(
         "Use `## ` for the top heading and `### ` for each section. "
         "Omit any section that has nothing to show."
     )
+    if diff:
+        system_content += (
+            "\n\nA code diff for this range is included below. Use it to understand "
+            "what actually changed when commit messages are vague — but describe the "
+            "changes in plain language; never quote raw diff syntax or code."
+        )
 
     # Build the commit block
     commit_lines: list[str] = []
@@ -39,6 +51,10 @@ def build_prompt(
         if commit.files:
             files_str = ", ".join(commit.files)
             commit_lines.append(f"Files: {files_str}")
+        if commit.insertions or commit.deletions:
+            commit_lines.append(
+                f"Changes: +{commit.insertions}/-{commit.deletions} lines"
+            )
         commit_lines.append("")  # blank separator between commits
 
     commits_block = "\n".join(commit_lines).rstrip()
@@ -52,6 +68,9 @@ def build_prompt(
         )
 
     user_parts.append(f"Commits:\n{commits_block}")
+
+    if diff:
+        user_parts.append(f"Code diff for this range:\n{diff}")
 
     user_content = "\n\n".join(user_parts)
 
@@ -90,6 +109,68 @@ def build_summary_prompt(changelog_markdown: str, detail: bool = False) -> list[
         )
     system_content = common + length_rules
     user_content = f"Changelog:\n{changelog_markdown}"
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def build_onboarding_prompt(
+    readme_text: str,
+    commits: list[Commit],
+    diff: str | None = None,
+) -> list[dict]:
+    """Return messages that orient a developer who just cloned this repo.
+
+    Combines the README (what the project IS) with recent commit activity
+    (what's actively being worked on) into a casual, spoken-friendly overview.
+    ``diff`` is opt-in — see :func:`build_prompt` for the same convention.
+
+    Returns:
+        [{"role": "system", "content": ...}, {"role": "user", "content": ...}]
+    """
+    system_content = (
+        "You are voicelog — a fun, friendly guide orienting a developer who just "
+        "cloned this repository for the first time. Your notes will be read ALOUD, "
+        "so write in a warm, casual, conversational tone.\n\n"
+        "Cover two things, in order:\n"
+        "1. What this project IS — summarise the README in plain terms: what it "
+        "does, who it's for.\n"
+        "2. What's been happening lately — summarise the recent commit activity: "
+        "what's actively being worked on.\n\n"
+        "If the README is missing or unhelpful, infer the project's purpose from "
+        "the commit subjects and file paths instead — say so if you're guessing.\n\n"
+        "Output FINISHED Markdown only — no preamble, no explanation. Use `## ` "
+        "for each of the two sections (e.g. `## What this is`, `## Recent activity`)."
+    )
+    if diff:
+        system_content += (
+            "\n\nA code diff for the recent commits is included below. Use it for "
+            "extra context if commit messages are vague — describe changes in plain "
+            "language; never quote raw diff syntax or code."
+        )
+
+    readme_block = readme_text.strip() if readme_text else "(no README found)"
+
+    commit_lines: list[str] = []
+    for commit in commits:
+        commit_lines.append(f"Subject: {commit.subject}")
+        if commit.body:
+            commit_lines.append(f"Body: {commit.body}")
+        if commit.files:
+            commit_lines.append(f"Files: {', '.join(commit.files)}")
+        if commit.insertions or commit.deletions:
+            commit_lines.append(
+                f"Changes: +{commit.insertions}/-{commit.deletions} lines"
+            )
+        commit_lines.append("")
+    commits_block = "\n".join(commit_lines).rstrip() or "(no recent commits)"
+
+    user_parts = [f"README:\n{readme_block}", f"Recent commits:\n{commits_block}"]
+    if diff:
+        user_parts.append(f"Code diff for these commits:\n{diff}")
+    user_content = "\n\n".join(user_parts)
 
     return [
         {"role": "system", "content": system_content},

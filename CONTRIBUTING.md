@@ -25,26 +25,41 @@ gitsource → filters → (voice) → prompt → llm → generate → render →
                                                                         ├─ tts (speak)
                                                                         ├─ cache (.voicelog-cache.json)
                                                                         └─ voicefile (voice.md, opt-in)
+
+--new takes a parallel path: readme + gitsource.read_recent_commits (ignores
+tags) → prompt.build_onboarding_prompt → generate.onboard → render.render_onboarding
+→ cli. Always transient — never cached, never writes voice.md.
 ```
 
 Each module has one job and is testable in isolation:
 
 | Module | Job |
 |--------|-----|
-| `gitsource` | git → `list[Commit]` for a range (since tag, `--since`, `--pull`, `--pr`) |
+| `gitsource` | git → `list[Commit]` for a range (since tag, `--since`, `--pull`, `--pr`, or `read_recent_commits` for `--new`) |
 | `filters` | drop noise commits by regex |
 | `voice` | load few-shot voice samples (optional) |
-| `prompt` | build the LLM messages (changelog + spoken summary) |
+| `readme` | load a repo's README for `--new` (optional) |
+| `prompt` | build the LLM messages (changelog, spoken summary, onboarding) |
 | `llm` | **provider-aware** — one OpenAI-compatible HTTP call + retry |
-| `generate` | orchestrate prompt + llm (`generate`, `summarize`) |
-| `render` | clean model output → final markdown |
+| `generate` | orchestrate prompt + llm (`generate`, `summarize`, `onboard`) |
+| `render` | clean model output → final markdown (changelog and onboarding variants) |
 | `cache` | skip regeneration when the commit set is unchanged |
 | `voicefile` | maintain the persistent `voice.md` (only with `--changelog`) |
-| `tts` | **provider-aware** — speak via NVIDIA Riva (gRPC) |
+| `tts` | **provider-aware** — dispatches to riva (gRPC) / openai / elevenlabs (httpx) |
 | `cli` | wire it together; own the flags and the error table |
 
-The only provider-aware modules are `llm` and `tts`. Swapping the text model /
-provider is a config change, never a code change.
+`Commit.insertions`/`Commit.deletions` (diffstat, from `git log --numstat`) are
+always available and included in prompts — no code ever sent. The actual code
+diff is a separate, opt-in field (`GitResult.diff`, populated when
+`with_diff=True`) threaded through `generate`/`prompt` only when the user
+passes `--with-diff`; `cli.py` prints a privacy warning whenever it does.
+
+The only provider-aware modules are `llm` and `tts`. Swapping the text model or
+speech engine is a config change, never a code change. `tts` picks its adapter
+via `config.tts_provider`; each adapter takes chunked text + an API key and
+returns `(pcm_bytes, sample_rate)` — the shared code stitches one WAV and plays
+it cross-platform. Add a new speech provider by writing one `_synth_<name>`
+function and registering it in `_ADAPTERS`.
 
 ## Conventions (please follow these)
 

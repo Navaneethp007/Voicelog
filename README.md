@@ -1,16 +1,15 @@
 # voicelog
 
-**The changelog that talks to you.** At any git moment — after a `git pull`, before opening a PR, or just to catch up — voicelog gives you a short spoken + written rundown of what changed, using a free LLM (NVIDIA NIM by default). Run `voicelog`, and it prints a casual changelog and **reads a summary aloud**.
+**The changelog that talks to you.** At any git moment — after a `git pull`, before opening a PR, or just to catch up — voicelog gives you a short spoken + written rundown of what changed. Both the LLM and the voice are configurable (NVIDIA, OpenAI, ElevenLabs, and more). Run `voicelog`, and it prints a casual changelog and **reads a summary aloud**.
 
 ## Install
 
 ```bash
-pip install "voicelog[tts]"   # core + speech (NVIDIA Riva TTS)
-# or, text only (works on any OS, no audio):
-pip install voicelog
+pip install voicelog            # core (text rundown; also all you need for OpenAI/ElevenLabs speech)
+pip install "voicelog[tts]"     # + NVIDIA Riva TTS support (only needed for the riva provider)
 ```
 
-Requires Python 3.10+. Speech playback currently uses Windows audio (`winsound`); on macOS/Linux the text rundown works and the spoken step is skipped with a warning.
+Requires Python 3.10+. Speech playback works on Windows, macOS, and Linux (via `winsound`, `afplay`, and `paplay`/`aplay`/`ffplay` respectively). The `[tts]` extra pulls in NVIDIA's gRPC client — only needed if you use `tts_provider: riva` (the default). If you set `tts_provider: openai` or `elevenlabs`, plain `pip install voicelog` is enough since those just use HTTP.
 
 Verify it's installed:
 
@@ -91,6 +90,26 @@ voicelog --since HEAD~10           # last 10 commits
 
 These are transient "what changed" views — they print and speak, but do **not** touch the persistent `.changelog/voice.md` (that's reserved for releases).
 
+### Orient yourself on a repo you just cloned
+
+`--new` gives you a spoken + written overview of a project you're new to: what it *is* (from the README) plus what's been *happening lately* (the most recent commits, regardless of tags/releases):
+
+```bash
+voicelog --new
+```
+
+Reads `onboard_commits` recent commits (default 15 — tune it in `changelog.yml`) and the repo's README (`README.md`/`.rst`/`.txt`). Missing a README? It still orients you from the commits alone. Like the other modes above, `--new` is transient — it never writes `.changelog/voice.md`.
+
+### Richer summaries with `--with-diff`
+
+By default voicelog sends only commit messages, changed filenames, and a diffstat (lines added/removed) to the model — never your actual code. If commit messages are vague and you want the model to understand what really changed, opt in to sending the real code diff:
+
+```bash
+voicelog --pull --with-diff
+```
+
+This prints a privacy warning every time, since it's the one thing in voicelog that sends code to the LLM provider. Works with every mode (default, `--pull`, `--pr`, `--since`, `--new`).
+
 ### More (or less) spoken detail
 
 By default the spoken summary is brief (2-3 sentences). For a fuller walkthrough of each change, add `--detail`:
@@ -134,7 +153,17 @@ voicelog talks to any **OpenAI-compatible** endpoint. Set three things in `chang
 | Groq (fast, free tier) | `https://api.groq.com/openai/v1` | `llama-3.1-8b-instant` | `GROQ_API_KEY` |
 | Ollama (local, no key) | `http://localhost:11434/v1` | `llama3.1` | any name |
 
-**Speech is NVIDIA Riva only**, so the spoken step always needs an NVIDIA key (`tts_api_key_env`), even if your text model is OpenAI or Groq. No NVIDIA key? Set `speak: false` — the text changelog still works everywhere.
+## Using your own voice
+
+The spoken part is just as configurable — set `tts_provider` in `changelog.yml`. All three work cross-platform (Windows/macOS/Linux) and are independent of your text LLM choice above (mix and match freely, e.g. Groq for text + ElevenLabs for voice).
+
+| Provider | tts_provider | tts_voice | tts_api_key_env |
+|----------|--------------|-----------|------------------|
+| NVIDIA Riva (default) | `riva` | `Magpie-Multilingual.EN-US.Sofia` | `NVIDIA_API_KEY` |
+| OpenAI TTS | `openai` | `alloy` (or echo/fable/onyx/nova/shimmer) | `OPENAI_API_KEY` |
+| ElevenLabs | `elevenlabs` | your ElevenLabs voice id | `ELEVENLABS_API_KEY` |
+
+No key for any of them? Set `speak: false` — the text changelog still works everywhere. See the comments in `changelog.yml` for the full field list per provider (`tts_model`, `tts_base_url`, etc).
 
 ## Configuration
 
@@ -146,16 +175,19 @@ Copy `changelog.yml` and edit it — all fields are optional, built-in defaults 
 | `sections` | Section grouping for the changelog |
 | `noise` | Regex commit subjects to drop (e.g. `^wip`) |
 | `speak` | `true`/`false` — read aloud (also `--no-speak` per run) |
-| `tts_voice` / `tts_language` | Riva voice + language |
+| `tts_provider` | `riva` / `openai` / `elevenlabs` |
+| `tts_voice` | Voice id/name — meaning depends on the provider |
 | `voice_md` | Path to the persistent changelog |
+| `max_commits` | Cap on commits sent to the model for normal ranges |
+| `onboard_commits` | Recent commits `--new` reads (ignores tags) |
 
-The only secret is `NVIDIA_API_KEY` — read from the environment, never stored in config.
+Every secret is read from an environment variable named in the config (`api_key_env` for text, `tts_api_key_env` for speech) — never stored in the file itself.
 
 ## Graceful degradation
 
 voicelog never blocks on audio. Text always prints first; if anything downstream fails it only warns to stderr:
 - **LLM unavailable** → prints a plain bulleted commit list instead.
-- **TTS not installed / non-Windows / audio error** → prints text, warns, skips speech.
+- **TTS misconfigured / key missing / no audio player / synthesis error** → prints text, warns, skips speech.
 
 ## Architecture
 
@@ -163,8 +195,9 @@ Pure data pipeline:
 
 ```
 gitsource → filters → voice → prompt → llm → render → cli ─┬─ stdout
-                                                           ├─ voicefile (.changelog/voice.md)
-                                                           └─ tts (speak aloud)
+  (or readme +                                            ├─ voicefile (.changelog/voice.md, opt-in)
+   read_recent_commits                                     └─ tts (speak aloud)
+   for --new)
 ```
 
 `llm` and `tts` are the only provider-aware modules. Swapping provider/model/voice is a config change, never a code change.

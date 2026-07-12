@@ -48,6 +48,19 @@ def test_cache_key_independent_of_commit_order():
     assert cache_key([a, b], "m", ["S"], "") == cache_key([b, a], "m", ["S"], "")
 
 
+def test_cache_key_changes_with_with_diff():
+    """A --with-diff run must not reuse a no-diff run's cached output (and vice
+    versa) — the prompt content, and therefore the expected output, differs."""
+    commits = [_commit("a")]
+    assert cache_key(commits, "m", ["S"], "") != cache_key(commits, "m", ["S"], "", with_diff=True)
+
+
+def test_cache_key_with_diff_defaults_to_false():
+    """Omitting with_diff is identical to passing with_diff=False."""
+    commits = [_commit("a")]
+    assert cache_key(commits, "m", ["S"], "") == cache_key(commits, "m", ["S"], "", with_diff=False)
+
+
 # ---------------------------------------------------------------------------
 # get / put
 # ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@
 > 📦 **PyPI release coming soon** — `pip install voicelog` isn't live yet. For now, install from source:
 
 ```bash
-git clone https://github.com/<your-username>/voicelog.git
+git clone https://github.com/Navaneethp007/voicelog.git
 cd voicelog
 
 pip install -e ".[tts]"   # core + speech (NVIDIA Riva TTS)

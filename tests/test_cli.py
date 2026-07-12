@@ -11,6 +11,54 @@ from voicelog.models import Commit
 from voicelog.tts import TTSError
 
 
+# ---------------------------------------------------------------------------
+# First-run interactive key prompt
+# ---------------------------------------------------------------------------
+
+def test_prompt_for_key_sets_env_when_interactive(monkeypatch):
+    monkeypatch.delenv("MY_KEY", raising=False)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": "nvapi-pasted")
+
+    cli._maybe_prompt_for_key("MY_KEY")
+
+    assert cli.os.environ.get("MY_KEY") == "nvapi-pasted"
+
+
+def test_prompt_for_key_noop_when_not_a_tty(monkeypatch):
+    monkeypatch.delenv("MY_KEY", raising=False)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+    called = {"asked": False}
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": called.__setitem__("asked", True) or "x")
+
+    cli._maybe_prompt_for_key("MY_KEY")
+
+    assert called["asked"] is False
+    assert cli.os.environ.get("MY_KEY") is None
+
+
+def test_prompt_for_key_skips_when_already_set(monkeypatch):
+    monkeypatch.setenv("MY_KEY", "already-here")
+    called = {"asked": False}
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": called.__setitem__("asked", True) or "x")
+
+    cli._maybe_prompt_for_key("MY_KEY")
+
+    assert called["asked"] is False
+    assert cli.os.environ.get("MY_KEY") == "already-here"
+
+
+def test_prompt_for_key_empty_input_leaves_unset(monkeypatch):
+    monkeypatch.delenv("MY_KEY", raising=False)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": "   ")
+
+    cli._maybe_prompt_for_key("MY_KEY")
+
+    assert cli.os.environ.get("MY_KEY") is None
+
+
 def _config():
     return Config(
         provider=DEFAULTS["provider"],

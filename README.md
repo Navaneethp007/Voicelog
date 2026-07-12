@@ -1,28 +1,43 @@
 # voicelog
 
-**The changelog that talks to you.** voicelog reads your git commits since the last tag, writes them up as a fun, casual changelog using a free LLM (NVIDIA NIM), prints it, **reads it aloud**, and keeps a running `.changelog/voice.md` across releases.
+**The changelog that talks to you.** At any git moment — after a `git pull`, before opening a PR, or just to catch up — voicelog gives you a short spoken + written rundown of what changed, using a free LLM (NVIDIA NIM by default). Run `voicelog`, and it prints a casual changelog and **reads a summary aloud**.
 
 ## Install
 
-```bash
-pip install -e .          # core (text changelog only)
-pip install -e ".[tts]"   # + speech (NVIDIA Riva TTS)
-```
-
-Requires Python 3.10+. Speech playback currently uses Windows audio (`winsound`).
-
-## Setup
-
-Get a free API key at [build.nvidia.com](https://build.nvidia.com) and set it. The same key powers both the changelog text and the speech.
+> 📦 **PyPI release coming soon** — `pip install voicelog` isn't live yet. For now, install from source:
 
 ```bash
-# bash / cmd / PowerShell respectively
-export NVIDIA_API_KEY=nvapi-...
-set NVIDIA_API_KEY=nvapi-...
-$env:NVIDIA_API_KEY = "nvapi-..."
+git clone https://github.com/<your-username>/voicelog.git
+cd voicelog
+
+pip install -e ".[tts]"   # core + speech (NVIDIA Riva TTS)
+# or, text only (works on any OS, no audio):
+pip install -e .
 ```
 
-To persist it on Windows: `setx NVIDIA_API_KEY "nvapi-..."` (then open a new terminal).
+Requires Python 3.10+. Speech playback currently uses Windows audio (`winsound`); on macOS/Linux the text rundown works and the spoken step is skipped with a warning.
+
+Verify it's installed:
+
+```bash
+voicelog --help
+```
+
+## Setup — one API key
+
+voicelog needs a free API key from [build.nvidia.com](https://build.nvidia.com) (no credit card). You can either let voicelog ask you on first run, or set it yourself.
+
+**Easiest:** just run `voicelog` in a repo — if no key is set, it prompts you to paste one and uses it for that session.
+
+**Or set it manually** (the same key powers text and speech):
+
+```bash
+export NVIDIA_API_KEY=nvapi-...     # bash / macOS / Linux
+set NVIDIA_API_KEY=nvapi-...        # Windows cmd (this session)
+$env:NVIDIA_API_KEY = "nvapi-..."   # PowerShell (this session)
+```
+
+To persist it on Windows so every terminal has it: `setx NVIDIA_API_KEY "nvapi-..."` (then open a new terminal).
 
 ## Usage
 

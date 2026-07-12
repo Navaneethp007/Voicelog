@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import sys
 
@@ -11,6 +12,30 @@ from voicelog.config import ConfigFileNotFound
 from voicelog.gitsource import NotAGitRepo, RefNotFound
 from voicelog.llm import LLMError, MissingApiKey
 from voicelog.tts import TTSError
+
+
+def _maybe_prompt_for_key(env_name: str) -> None:
+    """First-run helper: if the key env var is empty and we're in an interactive
+    terminal, ask the user to paste it and use it for this session."""
+    if os.environ.get(env_name):
+        return
+    if not sys.stdin.isatty():
+        return  # non-interactive (CI, pipe) — don't hang; let the normal error fire
+
+    print(f"No API key found in ${env_name}.", file=sys.stderr)
+    try:
+        key = getpass.getpass("Paste your API key (or press Enter to skip): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return
+    if not key:
+        return
+    os.environ[env_name] = key
+    if os.name == "nt":
+        tip = f'setx {env_name} "<your key>"  (then open a new terminal)'
+    else:
+        tip = f'export {env_name}=<your key>  (add to your shell profile)'
+    print(f"Using it for this session. To avoid this next time: {tip}", file=sys.stderr)
 
 
 def main() -> None:
@@ -100,6 +125,9 @@ def main() -> None:
     except ConfigFileNotFound as exc:
         print(f"error: config file not found: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    # First run with no key set → offer to paste one (interactive terminals only).
+    _maybe_prompt_for_key(cfg.api_key_env)
 
     # --- Read commits ---
     try:

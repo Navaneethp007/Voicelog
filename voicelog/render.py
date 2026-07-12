@@ -71,3 +71,36 @@ def render_fallback(commits: list[Commit]) -> str:
 
     bullets = "\n".join(f"- {c.subject}" for c in commits)
     return _HEADER + bullets
+
+
+_ONBOARD_HEADER = "# Project Overview\n\n"
+
+
+def render_onboarding(markdown: str) -> str:
+    """Clean model output for the ``--new`` onboarding rundown.
+
+    Distinct top-level header from render()'s ``## Unreleased`` — this isn't a
+    changelog, so it gets its own ``# Project Overview`` framing. The model's
+    ``## `` section headings (What this is / Recent activity) already nest
+    correctly under a single-``#`` wrapper, so — unlike render() — they are
+    NOT downgraded.
+    """
+    text = strip_reasoning(markdown)
+    text = text.strip()
+    text = _strip_empty_sections(text)
+    return _ONBOARD_HEADER + text
+
+
+def render_onboarding_fallback(readme_text: str, commits: list[Commit]) -> str:
+    """Plain fallback for ``--new`` when the LLM is unavailable — the raw
+    README plus a bulleted list of recent commit subjects, so onboarding is
+    never fully blocked."""
+    readme_block = readme_text.strip() if readme_text else "(no README found)"
+    if commits:
+        commits_block = "\n".join(f"- {c.subject}" for c in commits)
+    else:
+        commits_block = "(no recent commits)"
+    return (
+        f"{_ONBOARD_HEADER}## What this is\n\n{readme_block}\n\n"
+        f"## Recent activity\n\n{commits_block}"
+    )

@@ -12,7 +12,7 @@ import pytest
 from voicelog.models import Commit
 from voicelog.config import Config, DEFAULTS
 from voicelog.llm import complete, MissingApiKey, LLMError
-from voicelog.generate import generate, summarize
+from voicelog.generate import generate, summarize, onboard
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +103,32 @@ def test_generate_reraises_missing_api_key(sample_commits, config):
     assert exc_info.value is original_error
 
 
+# 5b. diff is threaded through to prompt.build_prompt when provided
+def test_generate_passes_diff_to_prompt_when_provided(sample_commits, config):
+    markdown = "## Features\n- x\n"
+    fake_messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    with patch("voicelog.generate.llm.complete", return_value=markdown):
+        with patch("voicelog.generate.prompt.build_prompt", return_value=fake_messages) as mock_build:
+            generate(sample_commits, "", config, diff="unique_diff_marker")
+
+    mock_build.assert_called_once()
+    _, kwargs = mock_build.call_args
+    assert kwargs.get("diff") == "unique_diff_marker"
+
+
+# 5c. diff defaults to None when not passed
+def test_generate_diff_defaults_to_none(sample_commits, config):
+    markdown = "## Features\n- x\n"
+    with patch("voicelog.generate.llm.complete", return_value=markdown):
+        with patch("voicelog.generate.prompt.build_prompt", return_value=[
+            {"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+        ]) as mock_build:
+            generate(sample_commits, "", config)
+
+    _, kwargs = mock_build.call_args
+    assert kwargs.get("diff") is None
+
+
 # ===========================================================================
 # summarize() — the short spoken digest
 # ===========================================================================
@@ -128,6 +154,61 @@ def test_summarize_strips_think_block(config):
     assert "<think>" not in result
     assert "let me reason" not in result
     assert "Two fixes and a new export option." in result
+
+
+# ===========================================================================
+# onboard() — orient a developer on a freshly cloned repo
+# ===========================================================================
+
+def test_onboard_returns_markdown_on_success(sample_commits, config):
+    markdown = "## What this is\nA tool.\n\n## Recent activity\n- did stuff"
+    with patch("voicelog.generate.llm.complete", return_value=markdown) as mock_complete:
+        result = onboard("some readme", sample_commits, config)
+    assert result == markdown
+    mock_complete.assert_called_once()
+
+
+def test_onboard_raises_on_empty_response(sample_commits, config):
+    with patch("voicelog.generate.llm.complete", return_value=""):
+        with pytest.raises(LLMError):
+            onboard("some readme", sample_commits, config)
+
+
+def test_onboard_passes_diff_to_prompt_when_provided(sample_commits, config):
+    markdown = "## What this is\nA tool.\n"
+    fake_messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    with patch("voicelog.generate.llm.complete", return_value=markdown):
+        with patch(
+            "voicelog.generate.prompt.build_onboarding_prompt", return_value=fake_messages
+        ) as mock_build:
+            onboard("readme text", sample_commits, config, diff="unique_onboard_diff")
+
+    mock_build.assert_called_once()
+    _, kwargs = mock_build.call_args
+    assert kwargs.get("diff") == "unique_onboard_diff"
+
+
+def test_onboard_reraises_llm_error(sample_commits, config):
+    original_error = LLMError("upstream failure")
+    with patch("voicelog.generate.llm.complete", side_effect=original_error):
+        with pytest.raises(LLMError) as exc_info:
+            onboard("readme text", sample_commits, config)
+    assert exc_info.value is original_error
+
+
+def test_onboard_reraises_missing_api_key(sample_commits, config):
+    original_error = MissingApiKey("Set NVIDIA_API_KEY env var — see https://build.nvidia.com")
+    with patch("voicelog.generate.llm.complete", side_effect=original_error):
+        with pytest.raises(MissingApiKey) as exc_info:
+            onboard("readme text", sample_commits, config)
+    assert exc_info.value is original_error
+
+
+def test_onboard_works_with_empty_commits(config):
+    markdown = "## What this is\nA tool.\n"
+    with patch("voicelog.generate.llm.complete", return_value=markdown):
+        result = onboard("readme text", [], config)
+    assert result == markdown
 
 
 # ===========================================================================

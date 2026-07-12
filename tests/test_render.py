@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from voicelog.models import Commit
-from voicelog.render import render, render_fallback
+from voicelog.render import render, render_fallback, render_onboarding, render_onboarding_fallback
 
 
 # ---------------------------------------------------------------------------
@@ -132,3 +132,75 @@ def test_render_fallback_includes_all_commit_subjects():
 def test_render_fallback_empty_commits_returns_just_header():
     result = render_fallback([])
     assert result.strip() == "## Unreleased"
+
+
+# ---------------------------------------------------------------------------
+# render_onboarding() / render_onboarding_fallback()  (--new)
+# ---------------------------------------------------------------------------
+
+
+def test_render_onboarding_prepends_project_overview_header():
+    result = render_onboarding("## What this is\nA tool.")
+    assert result.startswith("# Project Overview\n\n")
+
+
+def test_render_onboarding_strips_think_block():
+    markdown = "<think>reasoning</think>## What this is\nA tool."
+    result = render_onboarding(markdown)
+    assert "<think>" not in result
+    assert "reasoning" not in result
+    assert "A tool." in result
+
+
+def test_render_onboarding_strips_empty_sections():
+    markdown = "## Empty section\n\n## What this is\nA tool."
+    result = render_onboarding(markdown)
+    assert "Empty section" not in result
+    assert "A tool." in result
+
+
+def test_render_onboarding_does_not_downgrade_double_hash_headings():
+    """Unlike render(), the model's ## sections nest under the single-# wrapper
+    and must stay ## (not get downgraded to ###)."""
+    markdown = "## What this is\nA tool.\n## Recent activity\n- did stuff"
+    result = render_onboarding(markdown)
+    assert "## What this is" in result
+    assert "## Recent activity" in result
+    assert "###" not in result
+
+
+def test_render_onboarding_trims_whitespace():
+    markdown = "   \n  ## What this is\nA tool.  \n  "
+    result = render_onboarding(markdown)
+    body = result[len("# Project Overview\n\n"):]
+    assert body == body.strip()
+
+
+def test_render_onboarding_fallback_includes_readme():
+    result = render_onboarding_fallback("This project does unique_readme_thing.", [])
+    assert "unique_readme_thing" in result
+
+
+def test_render_onboarding_fallback_includes_commit_subjects():
+    commits = [
+        Commit(hash="a1", subject="Add feature X", body="", author="A", files=[]),
+        Commit(hash="b2", subject="Fix bug Y", body="", author="B", files=[]),
+    ]
+    result = render_onboarding_fallback("readme", commits)
+    assert "- Add feature X" in result
+    assert "- Fix bug Y" in result
+
+
+def test_render_onboarding_fallback_handles_empty_readme():
+    result = render_onboarding_fallback("", [])
+    assert "no readme" in result.lower()
+
+
+def test_render_onboarding_fallback_handles_empty_commits():
+    result = render_onboarding_fallback("some readme", [])
+    assert "no recent commits" in result.lower()
+
+
+def test_render_onboarding_fallback_starts_with_project_overview_header():
+    result = render_onboarding_fallback("readme", [])
+    assert result.startswith("# Project Overview")

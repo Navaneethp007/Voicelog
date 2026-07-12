@@ -198,6 +198,40 @@ def test_speak_happy_path(monkeypatch):
     assert len(played) == 1
 
 
+def test_speak_playback_failure_raises_ttserror(monkeypatch):
+    """A playback failure (busy/absent audio device on macOS/Linux) must become
+    a TTSError so the CLI's 'audio only warns, never blocks' contract holds."""
+    import subprocess
+
+    monkeypatch.setenv("NVIDIA_API_KEY", "key")
+    fake_riva, fake_encoding, service = _make_fake_riva()
+    monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
+
+    def boom(path):
+        raise subprocess.CalledProcessError(1, ["afplay", path])
+
+    monkeypatch.setattr(tts, "_play", boom)
+
+    with pytest.raises(TTSError):
+        tts.speak("Hello there.", FakeConfig())
+
+
+def test_speak_playback_missing_player_raises_ttserror(monkeypatch):
+    """If the player binary vanished after the availability check, that OSError
+    is also converted to TTSError rather than crashing."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "key")
+    fake_riva, fake_encoding, service = _make_fake_riva()
+    monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
+
+    def boom(path):
+        raise FileNotFoundError("afplay: not found")
+
+    monkeypatch.setattr(tts, "_play", boom)
+
+    with pytest.raises(TTSError):
+        tts.speak("Hello there.", FakeConfig())
+
+
 def test_speak_synthesize_exception_raises(monkeypatch):
     monkeypatch.setenv("NVIDIA_API_KEY", "key")
     fake_riva, fake_encoding, service = _make_fake_riva()
@@ -225,3 +259,134 @@ def test_speak_timeout_raises_clean_error(monkeypatch):
     assert "timed out" in str(exc.value).lower()
     # The hung call is cancelled so the channel isn't left dangling.
     service.synthesize.return_value.cancel.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Provider dispatch — unknown provider, provider-specific key errors
+# ---------------------------------------------------------------------------
+
+class OpenAIConfig(FakeConfig):
+    tts_provider = "openai"
+    tts_model = "gpt-4o-mini-tts"
+    tts_base_url = ""
+    tts_voice = "alloy"
+    tts_api_key_env = "OPENAI_API_KEY"
+
+
+class ElevenLabsConfig(FakeConfig):
+    tts_provider = "elevenlabs"
+    tts_model = "eleven_multilingual_v2"
+    tts_voice = "voice-id-123"
+    tts_api_key_env = "ELEVENLABS_API_KEY"
+
+
+def test_unknown_provider_raises_before_any_network_call(monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "key")
+
+    class BadConfig(FakeConfig):
+        tts_provider = "not-a-real-provider"
+
+    with pytest.raises(TTSError) as exc:
+        tts.speak("Hello there.", BadConfig())
+    assert "not-a-real-provider" in str(exc.value)
+
+
+def test_openai_missing_key_names_configured_env(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(TTSError) as exc:
+        tts.speak("Hello there.", OpenAIConfig())
+    assert "OPENAI_API_KEY" in str(exc.value)
+
+
+def test_openai_happy_path_posts_and_plays(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    played = []
+    monkeypatch.setattr(tts, "_play", lambda path: played.append(path))
+
+    mock_resp = mock.MagicMock()
+    mock_resp.is_success = True
+    mock_resp.content = b"\x01\x02\x03\x04"
+
+    with mock.patch("voicelog.tts.httpx.post", return_value=mock_resp) as mock_post:
+        tts.speak("Hello there.", OpenAIConfig())
+
+    mock_post.assert_called_once()
+    call_args, call_kwargs = mock_post.call_args
+    assert call_args[0] == "https://api.openai.com/v1/audio/speech"
+    assert call_kwargs["headers"]["Authorization"] == "Bearer sk-test"
+    body = call_kwargs["json"]
+    assert body["model"] == "gpt-4o-mini-tts"
+    assert body["voice"] == "alloy"
+    assert body["response_format"] == "pcm"
+    assert len(played) == 1
+
+
+def test_openai_custom_base_url_is_used(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(tts, "_play", lambda path: None)
+
+    class CustomConfig(OpenAIConfig):
+        tts_base_url = "https://my-proxy.example.com/v1"
+
+    mock_resp = mock.MagicMock()
+    mock_resp.is_success = True
+    mock_resp.content = b"\x01\x02"
+
+    with mock.patch("voicelog.tts.httpx.post", return_value=mock_resp) as mock_post:
+        tts.speak("Hi", CustomConfig())
+
+    call_args, _ = mock_post.call_args
+    assert call_args[0] == "https://my-proxy.example.com/v1/audio/speech"
+
+
+def test_openai_http_failure_raises_ttserror(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(tts, "_play", lambda path: None)
+
+    mock_resp = mock.MagicMock()
+    mock_resp.is_success = False
+    mock_resp.status_code = 401
+    mock_resp.text = "unauthorized"
+
+    with mock.patch("voicelog.tts.httpx.post", return_value=mock_resp):
+        with pytest.raises(TTSError) as exc:
+            tts.speak("Hello there.", OpenAIConfig())
+    assert "401" in str(exc.value)
+
+
+def test_elevenlabs_missing_key_names_configured_env(monkeypatch):
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    with pytest.raises(TTSError) as exc:
+        tts.speak("Hello there.", ElevenLabsConfig())
+    assert "ELEVENLABS_API_KEY" in str(exc.value)
+
+
+def test_elevenlabs_happy_path_posts_and_plays(monkeypatch):
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "el-test")
+    played = []
+    monkeypatch.setattr(tts, "_play", lambda path: played.append(path))
+
+    mock_resp = mock.MagicMock()
+    mock_resp.is_success = True
+    mock_resp.content = b"\x05\x06\x07\x08"
+
+    with mock.patch("voicelog.tts.httpx.post", return_value=mock_resp) as mock_post:
+        tts.speak("Hello there.", ElevenLabsConfig())
+
+    mock_post.assert_called_once()
+    call_args, call_kwargs = mock_post.call_args
+    assert "voice-id-123" in call_args[0]
+    assert call_kwargs["headers"]["xi-api-key"] == "el-test"
+    assert call_kwargs["json"]["model_id"] == "eleven_multilingual_v2"
+    assert len(played) == 1
+
+
+def test_elevenlabs_missing_voice_id_raises(monkeypatch):
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "el-test")
+
+    class NoVoiceConfig(ElevenLabsConfig):
+        tts_voice = ""
+
+    with pytest.raises(TTSError) as exc:
+        tts.speak("Hello there.", NoVoiceConfig())
+    assert "tts_voice" in str(exc.value)

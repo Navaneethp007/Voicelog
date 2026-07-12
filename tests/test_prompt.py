@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from voicelog.models import Commit
-from voicelog.prompt import build_prompt, build_summary_prompt
+from voicelog.prompt import build_prompt, build_summary_prompt, build_onboarding_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +171,109 @@ def test_system_message_is_casual_narrator(sample_commits, sections):
     # Still groups into sections (grouping must survive the tone change).
     for section in sections:
         assert section in result[0]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Diffstat + optional full diff (richer signal than commit messages alone)
+# ---------------------------------------------------------------------------
+
+def test_diffstat_included_when_commit_has_stats(sections):
+    commits = [
+        Commit(
+            hash="a1", subject="feat: big change", body="", author="A",
+            files=["a.py"], insertions=42, deletions=7,
+        )
+    ]
+    result = build_prompt(commits, "", sections)
+    user_content = result[1]["content"]
+    assert "42" in user_content
+    assert "7" in user_content
+
+
+def test_diffstat_omitted_for_commit_with_no_stats(sample_commits, sections):
+    """Commits with insertions=deletions=0 (the common default) don't add noise."""
+    result = build_prompt(sample_commits, "", sections)
+    user_content = result[1]["content"]
+    # No stray "+0/-0" style clutter for every commit.
+    assert "+0" not in user_content and "-0" not in user_content
+
+
+def test_diff_absent_by_default(sample_commits, sections):
+    result = build_prompt(sample_commits, "", sections)
+    user_content = result[1]["content"]
+    assert "@@" not in user_content
+    assert "diff --git" not in user_content
+
+
+def test_diff_included_when_provided(sample_commits, sections):
+    diff_text = "diff --git a/x.py b/x.py\n@@ -1 +1 @@\n-old_unique_marker\n+new_unique_marker\n"
+    result = build_prompt(sample_commits, "", sections, diff=diff_text)
+    user_content = result[1]["content"]
+    assert "new_unique_marker" in user_content
+    assert "old_unique_marker" in user_content
+
+
+def test_diff_none_explicit_same_as_default(sample_commits, sections):
+    result = build_prompt(sample_commits, "", sections, diff=None)
+    user_content = result[1]["content"]
+    assert "@@" not in user_content
+
+
+def test_diff_empty_string_treated_as_absent(sample_commits, sections):
+    result = build_prompt(sample_commits, "", sections, diff="")
+    user_content = result[1]["content"]
+    assert "@@" not in user_content
+
+
+# ---------------------------------------------------------------------------
+# build_onboarding_prompt — orient a developer on a freshly cloned repo
+# ---------------------------------------------------------------------------
+
+def test_onboarding_returns_two_messages(sample_commits):
+    result = build_onboarding_prompt("A README.", sample_commits)
+    assert len(result) == 2
+    assert result[0]["role"] == "system"
+    assert result[1]["role"] == "user"
+
+
+def test_onboarding_includes_readme_text(sample_commits):
+    result = build_onboarding_prompt("This project does unique_readme_thing.", sample_commits)
+    assert "unique_readme_thing" in result[1]["content"]
+
+
+def test_onboarding_missing_readme_does_not_crash(sample_commits):
+    result = build_onboarding_prompt("", sample_commits)
+    assert "no readme" in result[1]["content"].lower() or result[1]["content"].strip() != ""
+
+
+def test_onboarding_includes_commit_subjects(sample_commits):
+    result = build_onboarding_prompt("readme text", sample_commits)
+    for commit in sample_commits:
+        assert commit.subject in result[1]["content"]
+
+
+def test_onboarding_system_message_mentions_orientation(sample_commits):
+    result = build_onboarding_prompt("readme text", sample_commits)
+    system_content = result[0]["content"].lower()
+    assert "clone" in system_content or "orient" in system_content
+    assert "aloud" in system_content
+
+
+def test_onboarding_diff_absent_by_default(sample_commits):
+    result = build_onboarding_prompt("readme", sample_commits)
+    assert "@@" not in result[1]["content"]
+
+
+def test_onboarding_diff_included_when_provided(sample_commits):
+    diff_text = "diff --git a/x.py b/x.py\n@@ -1 +1 @@\n+onboard_diff_marker\n"
+    result = build_onboarding_prompt("readme", sample_commits, diff=diff_text)
+    assert "onboard_diff_marker" in result[1]["content"]
+
+
+def test_onboarding_empty_commits_list_does_not_crash():
+    result = build_onboarding_prompt("readme text only", [])
+    assert len(result) == 2
+    assert "readme text only" in result[1]["content"]
 
 
 # ---------------------------------------------------------------------------

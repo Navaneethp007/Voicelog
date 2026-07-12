@@ -31,6 +31,7 @@ DEFAULTS: dict[str, Any] = {
     "voice_samples": ".changelog/voice/",
     "fallback_commits": 50,
     "max_commits": 50,  # cap sent to the model on large ranges (keeps it fast/cheap)
+    "onboard_commits": 15,  # recent commits used by --new to orient a fresh clone
     # --- Phase 2: speech + persistent casual changelog ---
     "speak": True,  # always speak (degrades gracefully if TTS unavailable)
     "tts_function_id": "877104f7-e885-42b9-8de8-f6e4c6303969",  # magpie-tts-multilingual
@@ -38,7 +39,10 @@ DEFAULTS: dict[str, Any] = {
     "tts_language": "en-US",
     "tts_sample_rate": 44100,
     "tts_timeout": 90.0,  # seconds per speech request before giving up
-    "tts_api_key_env": "NVIDIA_API_KEY",  # TTS is NVIDIA Riva; key env is independent
+    "tts_provider": "riva",  # riva | openai | elevenlabs
+    "tts_model": "",  # openai/elevenlabs model id (blank → provider default)
+    "tts_base_url": "",  # openai override (blank → provider default)
+    "tts_api_key_env": "NVIDIA_API_KEY",  # env var for the TTS key (per provider)
     "speech_detail": "brief",  # "brief" (2-3 sentences) or "detailed" (fuller rundown)
     "voice_md": ".changelog/voice.md",
     # Default is a transient rundown (print + speak). Set true (or pass --changelog)
@@ -73,6 +77,10 @@ class Config:
     tts_api_key_env: str = "NVIDIA_API_KEY"
     write_changelog: bool = False
     speech_detail: str = "brief"
+    tts_provider: str = "riva"
+    tts_model: str = ""
+    tts_base_url: str = ""
+    onboard_commits: int = 15
 
 
 # ---------------------------------------------------------------------------
@@ -124,4 +132,8 @@ def _build(data: dict[str, Any]) -> Config:
         tts_api_key_env=data["tts_api_key_env"],
         write_changelog=bool(data["write_changelog"]),
         speech_detail=data["speech_detail"],
+        tts_provider=data["tts_provider"],
+        tts_model=data["tts_model"],
+        tts_base_url=data["tts_base_url"],
+        onboard_commits=int(data["onboard_commits"]),
     )

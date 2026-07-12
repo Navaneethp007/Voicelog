@@ -40,12 +40,20 @@ def _slot(detail: bool) -> str:
     return "detailed" if detail else "brief"
 
 
-def cache_key(commits: list[Commit], model: str, sections: list[str], voice_text: str) -> str:
+def cache_key(
+    commits: list[Commit],
+    model: str,
+    sections: list[str],
+    voice_text: str,
+    with_diff: bool = False,
+) -> str:
     """Stable key for a generation request.
 
     Keyed on the SET of commit hashes (order-independent), the model, the ordered
-    section list, and the voice-sample text (which is injected into the prompt).
-    Changing any of these invalidates the cache.
+    section list, the voice-sample text, and whether a code diff was included
+    (``with_diff`` — different prompt content, so a diff run and a no-diff run
+    for the same commits must never share cached output). Changing any of these
+    invalidates the cache.
     """
     hashes = sorted(c.hash for c in commits)
     payload = json.dumps(
@@ -54,6 +62,7 @@ def cache_key(commits: list[Commit], model: str, sections: list[str], voice_text
             "model": model,
             "sections": list(sections),
             "voice": voice_text,
+            "with_diff": with_diff,
         },
         sort_keys=True,
     )

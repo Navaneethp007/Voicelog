@@ -40,20 +40,80 @@ voicelog --fresh
 voicelog --config path/to/changelog.yml
 ```
 
+### Catch up on a `git pull`
+
+Just pulled a branch and want to know what landed? `--pull` summarizes exactly the commits the pull brought in (everything since `ORIG_HEAD`) — text + voice:
+
+```bash
+git pull
+voicelog --pull          # "here's what you just pulled", spoken + printed
+```
+
+### Preview a PR before you open it
+
+On a feature branch, `--pr` summarizes what your branch would put in a pull request — the commits since the base branch. The base is auto-detected (`origin/HEAD`, falling back to `main`/`master`), or you can name it:
+
+```bash
+voicelog --pr           # against the auto-detected base
+voicelog --pr develop   # against a base branch you choose
+```
+
+### Diff against any ref
+
+Or compare against any ref with `--since`:
+
+```bash
+voicelog --since main              # commits since main
+voicelog --since v1.2.0            # commits since a tag
+voicelog --since HEAD~10           # last 10 commits
+```
+
+These are transient "what changed" views — they print and speak, but do **not** touch the persistent `.changelog/voice.md` (that's reserved for releases).
+
+### More (or less) spoken detail
+
+By default the spoken summary is brief (2-3 sentences). For a fuller walkthrough of each change, add `--detail`:
+
+```bash
+voicelog --pull --detail
+```
+
+Set `speech_detail: detailed` in `changelog.yml` to make it the default. (The printed text is always the full changelog — this only changes the *spoken* part.)
+
 ### Caching
 
 The generated changelog is cached on the **set of commits** (in `.changelog/.voicelog-cache.json`). Re-running with the same commits returns the cached text instead of calling the model again — so repeat runs are free, fast, and don't churn `voice.md`. Add a new commit (or pass `--fresh`) to regenerate. You'll usually want to git-ignore the cache file.
 
+By default, each run is a **transient rundown** — it prints the casual changelog and reads a short spoken summary aloud, but doesn't write anything. That's the everyday use: quick "what changed" at a git moment.
+
 Each run:
-1. Prints the casual changelog (under `## Unreleased`) to stdout.
-2. Reads it aloud via NVIDIA Riva TTS.
-3. Updates `.changelog/voice.md` — a persistent changelog that accumulates across releases.
+1. Prints the full casual changelog (under `## Unreleased`) to stdout.
+2. Reads a **short spoken summary** aloud via NVIDIA Riva TTS (2-3 sentences — not the whole changelog, so audio stays quick even on huge repos).
+
+Add `--changelog` (or set `write_changelog: true`) to *also* maintain a persistent release changelog at `.changelog/voice.md` that accumulates across releases (with automatic promotion when you tag). That's opt-in — most runs don't need it.
+
+### Working on large repos
+
+For big histories (e.g. a fork with hundreds of commits since the last tag), voicelog caps how many commits it sends to the model — the most recent `max_commits` (default 50) — so generation stays fast and cheap. The spoken part is always a short summary, so it never gets stuck reading a giant changelog aloud. Tune `max_commits` in `changelog.yml`, or use `--no-speak` for instant text-only output.
 
 ## Persistent changelog (`.changelog/voice.md`)
 
 voicelog maintains this file for you:
 - Keeps the current `## Unreleased` block at the top, refreshed each run (idempotent — running twice with no new commits changes nothing).
 - When you `git tag` a release, the previous `## Unreleased` is **promoted** to `## <tag>` and a fresh `## Unreleased` starts above it. Your history accumulates; nothing is lost.
+
+## Using your own LLM
+
+voicelog talks to any **OpenAI-compatible** endpoint. Set three things in `changelog.yml` — `base_url`, `model`, and `api_key_env` (the name of the env var your key lives in) — then export that key. The key is never stored in the file.
+
+| Provider | base_url | model | api_key_env |
+|----------|----------|-------|-------------|
+| NVIDIA (default) | `https://integrate.api.nvidia.com/v1` | `mistralai/mistral-medium-3.5-128b` | `NVIDIA_API_KEY` |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` | `OPENAI_API_KEY` |
+| Groq (fast, free tier) | `https://api.groq.com/openai/v1` | `llama-3.1-8b-instant` | `GROQ_API_KEY` |
+| Ollama (local, no key) | `http://localhost:11434/v1` | `llama3.1` | any name |
+
+**Speech is NVIDIA Riva only**, so the spoken step always needs an NVIDIA key (`tts_api_key_env`), even if your text model is OpenAI or Groq. No NVIDIA key? Set `speak: false` — the text changelog still works everywhere.
 
 ## Configuration
 

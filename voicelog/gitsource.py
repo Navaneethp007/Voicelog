@@ -15,6 +15,10 @@ class NoCommitsFound(Exception):
     """Raised when the commit range yields no commits (reserved for future use)."""
 
 
+class RefNotFound(Exception):
+    """Raised when a --since/--pull ref cannot be resolved to a commit."""
+
+
 @dataclass
 class GitResult:
     commits: list[Commit]
@@ -56,31 +60,61 @@ def _parse_log_output(output: str) -> list[Commit]:
     return commits
 
 
-def read_commits(fallback_commits: int = 50) -> GitResult:
-    """Return commits since the last tag (or last *fallback_commits* if no tag)."""
+_PRETTY = "--pretty=format:\x1e%H\x1f%s\x1f%b\x1f%an\x1f"
+
+
+def detect_base_branch() -> str | None:
+    """Best-effort guess of the branch a PR would target.
+
+    Prefers the remote's default branch (``origin/HEAD``); otherwise falls back
+    to the first conventional trunk that exists. Returns ``None`` if none found.
+    """
+    remote_head = _run("git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if remote_head.returncode == 0 and remote_head.stdout.strip():
+        return remote_head.stdout.strip()  # e.g. "origin/main"
+
+    for candidate in ("origin/main", "origin/master", "main", "master"):
+        found = _run("git", "rev-parse", "--verify", "--quiet", candidate)
+        if found.returncode == 0:
+            return candidate
+    return None
+
+
+def read_commits(fallback_commits: int = 50, since: str | None = None) -> GitResult:
+    """Return commits to summarise.
+
+    - ``since`` given → commits in ``since..HEAD`` (e.g. what a git pull brought
+      in via ``ORIG_HEAD``). Raises :class:`RefNotFound` if the ref is invalid.
+    - otherwise → commits since the last tag, or the last ``fallback_commits``
+      when the repo has no tags.
+    """
     # 1. Verify we're inside a git work-tree.
     check = _run("git", "rev-parse", "--is-inside-work-tree")
     if check.returncode != 0:
         raise NotAGitRepo("Current directory is not inside a git repository.")
 
-    # 2. Find the most recent tag.
-    tag_result = _run("git", "describe", "--tags", "--abbrev=0")
-    used_fallback = tag_result.returncode != 0
-    last_tag = None if used_fallback else tag_result.stdout.strip()
-
-    if not used_fallback:
-        revision_range = f"{last_tag}..HEAD"
-        log_args = [
-            "git", "log", revision_range,
-            "--pretty=format:\x1e%H\x1f%s\x1f%b\x1f%an\x1f",
-            "--name-only",
-        ]
+    if since is not None:
+        # 2a. Explicit range: <since>..HEAD. Validate the ref first.
+        verify = _run("git", "rev-parse", "--verify", "--quiet", f"{since}^{{commit}}")
+        if verify.returncode != 0:
+            raise RefNotFound(since)
+        used_fallback = False
+        last_tag = None
+        log_args = ["git", "log", f"{since}..HEAD", _PRETTY, "--name-only"]
     else:
-        log_args = [
-            "git", "log", f"-n{fallback_commits}",
-            "--pretty=format:\x1e%H\x1f%s\x1f%b\x1f%an\x1f",
-            "--name-only",
-        ]
+        # 2b. Find the most recent tag.
+        tag_result = _run("git", "describe", "--tags", "--abbrev=0")
+        used_fallback = tag_result.returncode != 0
+        last_tag = None if used_fallback else tag_result.stdout.strip()
+
+        if not used_fallback:
+            log_args = [
+                "git", "log", f"{last_tag}..HEAD", _PRETTY, "--name-only",
+            ]
+        else:
+            log_args = [
+                "git", "log", f"-n{fallback_commits}", _PRETTY, "--name-only",
+            ]
 
     # 3. Run git log.
     log_result = _run(*log_args)

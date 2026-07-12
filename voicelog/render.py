@@ -10,6 +10,11 @@ _HEADER = "## Unreleased\n\n"
 # Matches a <think>...</think> block at the very start of the string (multiline).
 _THINK_RE = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
 
+
+def strip_reasoning(text: str) -> str:
+    """Remove a leading <think>...</think> block (emitted by reasoning models)."""
+    return _THINK_RE.sub("", text)
+
 # Matches ## headings (but NOT ### or more).
 _H2_RE = re.compile(r"^## (.+)$", re.MULTILINE)
 
@@ -44,7 +49,7 @@ def _strip_empty_sections(text: str) -> str:
 def render(markdown: str) -> str:
     """Strip reasoning block, normalise headings, prepend ## Unreleased header."""
     # Strip leading <think>...</think> block if present.
-    text = _THINK_RE.sub("", markdown)
+    text = strip_reasoning(markdown)
 
     # Trim surrounding whitespace.
     text = text.strip()

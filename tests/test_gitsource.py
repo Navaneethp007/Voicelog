@@ -8,7 +8,14 @@ import subprocess
 
 import pytest
 
-from voicelog.gitsource import NotAGitRepo, NoCommitsFound, GitResult, read_commits
+from voicelog.gitsource import (
+    NotAGitRepo,
+    NoCommitsFound,
+    RefNotFound,
+    GitResult,
+    read_commits,
+    detect_base_branch,
+)
 from voicelog.models import Commit
 
 
@@ -57,6 +64,84 @@ class TestNotAGitRepo:
 
         with pytest.raises(NotAGitRepo):
             read_commits()
+
+
+class TestSinceRef:
+    def test_since_returns_commits_after_ref(self, tmp_path, monkeypatch):
+        """read_commits(since=REF) returns only commits in REF..HEAD."""
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, filename="a.txt", message="feat: first")
+        # capture this point as the 'since' ref
+        rev = run("git", "rev-parse", "HEAD").stdout.strip()
+        add_commit(run, repo, filename="b.txt", message="feat: second")
+        add_commit(run, repo, filename="c.txt", message="fix: third")
+        monkeypatch.chdir(repo)
+
+        result = read_commits(since=rev)
+
+        subjects = [c.subject for c in result.commits]
+        assert subjects == ["fix: third", "feat: second"]  # newest first, first excluded
+        assert result.used_fallback is False
+
+    def test_since_ignores_tags(self, tmp_path, monkeypatch):
+        """since range is independent of the last tag."""
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, filename="a.txt", message="feat: base")
+        run("git", "tag", "v9.9.9")
+        rev = run("git", "rev-parse", "HEAD").stdout.strip()
+        add_commit(run, repo, filename="b.txt", message="feat: after ref")
+        monkeypatch.chdir(repo)
+
+        result = read_commits(since=rev)
+
+        assert [c.subject for c in result.commits] == ["feat: after ref"]
+
+    def test_since_invalid_ref_raises(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, message="feat: only")
+        monkeypatch.chdir(repo)
+
+        with pytest.raises(RefNotFound):
+            read_commits(since="no-such-ref-xyz")
+
+    def test_since_no_new_commits_returns_empty(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, message="feat: only")
+        rev = run("git", "rev-parse", "HEAD").stdout.strip()
+        monkeypatch.chdir(repo)
+
+        result = read_commits(since=rev)  # nothing after HEAD
+
+        assert result.commits == []
+
+
+class TestDetectBaseBranch:
+    def test_detects_main_when_present(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, message="feat: base")
+        run("git", "branch", "-M", "main")
+        run("git", "checkout", "-q", "-b", "feature")
+        add_commit(run, repo, filename="f.txt", message="feat: work")
+        monkeypatch.chdir(repo)
+
+        assert detect_base_branch() == "main"
+
+    def test_detects_master_when_that_is_the_trunk(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, message="feat: base")
+        run("git", "branch", "-M", "master")
+        run("git", "checkout", "-q", "-b", "feature")
+        monkeypatch.chdir(repo)
+
+        assert detect_base_branch() == "master"
+
+    def test_returns_none_when_no_conventional_trunk(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, message="feat: base")
+        run("git", "branch", "-M", "trunk")  # neither main nor master
+        monkeypatch.chdir(repo)
+
+        assert detect_base_branch() is None
 
 
 class TestEmptyCommits:

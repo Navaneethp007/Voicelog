@@ -5,6 +5,7 @@ from voicelog.models import Commit
 from voicelog.llm import LLMError, MissingApiKey
 from voicelog import llm
 from voicelog import prompt
+from voicelog import render
 
 
 def generate(commits: list[Commit], voice_text: str, config) -> str:
@@ -31,3 +32,22 @@ def generate(commits: list[Commit], voice_text: str, config) -> str:
         raise LLMError("Empty response from model")
 
     return raw_markdown
+
+
+def summarize(changelog_markdown: str, config, detail: bool = False) -> str:
+    """Return a spoken-word summary of a full changelog (for TTS).
+
+    ``detail`` selects a fuller walkthrough instead of the brief 2-3 sentences.
+
+    Raises:
+        LLMError:      From llm.complete, or if the response is empty.
+        MissingApiKey: From llm.complete when the API key is absent.
+    """
+    messages = prompt.build_summary_prompt(changelog_markdown, detail=detail)
+    reply = llm.complete(messages, config)
+
+    if not reply or not reply.strip():
+        raise LLMError("Empty summary from model")
+
+    # Strip any leading reasoning block and surrounding whitespace.
+    return render.strip_reasoning(reply).strip()

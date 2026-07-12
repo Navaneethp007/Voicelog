@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from voicelog.models import Commit
-from voicelog.prompt import build_prompt
+from voicelog.prompt import build_prompt, build_summary_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -171,3 +171,43 @@ def test_system_message_is_casual_narrator(sample_commits, sections):
     # Still groups into sections (grouping must survive the tone change).
     for section in sections:
         assert section in result[0]["content"]
+
+
+# ---------------------------------------------------------------------------
+# build_summary_prompt — the short spoken digest
+# ---------------------------------------------------------------------------
+
+def test_summary_prompt_returns_two_messages():
+    result = build_summary_prompt("## Unreleased\n\n### Features\n- A cool thing")
+    assert len(result) == 2
+    assert result[0]["role"] == "system"
+    assert result[1]["role"] == "user"
+
+
+def test_summary_prompt_asks_for_short_spoken_plaintext():
+    result = build_summary_prompt("## Unreleased\n\n- x")
+    system = result[0]["content"].lower()
+    # Must steer toward a short, spoken, plain-text digest (no markdown read aloud).
+    assert "spoken" in system or "aloud" in system or "read out" in system
+    assert "sentence" in system  # bounded length
+    assert "markdown" in system or "plain" in system
+
+
+def test_summary_prompt_includes_the_changelog():
+    changelog = "## Unreleased\n\n### Features\n- Added PDF export"
+    result = build_summary_prompt(changelog)
+    assert "Added PDF export" in result[1]["content"]
+
+
+def test_summary_prompt_brief_is_short():
+    result = build_summary_prompt("## Unreleased\n\n- x", detail=False)
+    assert "2 to 3" in result[0]["content"]
+
+
+def test_summary_prompt_detailed_asks_for_more():
+    brief = build_summary_prompt("## Unreleased\n\n- x", detail=False)[0]["content"]
+    detailed = build_summary_prompt("## Unreleased\n\n- x", detail=True)[0]["content"]
+    assert brief != detailed
+    low = detailed.lower()
+    assert "2 to 3" not in detailed  # not capped to the tiny length
+    assert "each" in low or "detailed" in low or "rundown" in low

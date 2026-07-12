@@ -122,10 +122,12 @@ def speak(text: str, config) -> None:
     # Check playback availability before spending an API call.
     _check_playback()
 
-    api_key = os.environ.get("NVIDIA_API_KEY")
+    env_name = getattr(config, "tts_api_key_env", "NVIDIA_API_KEY")
+    api_key = os.environ.get(env_name)
     if not api_key:
         raise TTSError(
-            "Set NVIDIA_API_KEY env var — see https://build.nvidia.com"
+            f"Set the {env_name} environment variable — NVIDIA Riva TTS needs an "
+            f"NVIDIA API key (see https://build.nvidia.com)."
         )
 
     speech = _speech_text(text)
@@ -136,6 +138,9 @@ def speak(text: str, config) -> None:
     if not chunks:
         return
 
+    import grpc  # always present when riva.client imported successfully
+
+    timeout = getattr(config, "tts_timeout", 90.0)
     try:
         auth = riva_client.Auth(
             uri="grpc.nvcf.nvidia.com:443",
@@ -149,14 +154,29 @@ def speak(text: str, config) -> None:
 
         pcm = bytearray()
         for chunk in chunks:
-            resp = service.synthesize(
+            # Use the async future path so we can enforce a client-side deadline —
+            # riva's synchronous synthesize() has no timeout and blocks forever if
+            # the hosted model is slow to respond or the stream hangs.
+            call = service.synthesize(
                 chunk,
                 voice_name=config.tts_voice,
                 language_code=config.tts_language,
                 sample_rate_hz=config.tts_sample_rate,
                 encoding=AudioEncoding.LINEAR_PCM,
+                future=True,
             )
+            try:
+                resp = call.result(timeout=timeout)
+            except grpc.FutureTimeoutError as exc:
+                call.cancel()
+                raise TTSError(
+                    f"speech synthesis timed out after {timeout:.0f}s — the TTS "
+                    f"service was too slow. Try again, raise tts_timeout, or use "
+                    f"--no-speak."
+                ) from exc
             pcm.extend(resp.audio)
+    except TTSError:
+        raise
     except Exception as exc:
         raise TTSError(str(exc)) from exc
 

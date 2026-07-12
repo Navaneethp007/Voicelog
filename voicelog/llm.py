@@ -28,10 +28,12 @@ def complete(messages: list[dict], config) -> str:
         MissingApiKey: If NVIDIA_API_KEY is not set.
         LLMError:      If both request attempts fail.
     """
-    api_key = os.environ.get("NVIDIA_API_KEY")
+    env_name = getattr(config, "api_key_env", "NVIDIA_API_KEY")
+    api_key = os.environ.get(env_name)
     if not api_key:
         raise MissingApiKey(
-            "Set NVIDIA_API_KEY env var — see https://build.nvidia.com"
+            f"Set the {env_name} environment variable with your "
+            f"{getattr(config, 'provider', 'LLM')} API key."
         )
 
     url = f"{config.base_url}/chat/completions"
@@ -46,6 +48,8 @@ def complete(messages: list[dict], config) -> str:
         "max_tokens": 4096,
     }
 
+    timeout = getattr(config, "llm_timeout", 120.0)
+
     last_exc: Exception | None = None
     for attempt in range(2):  # try once, retry once on failure
         try:
@@ -53,7 +57,7 @@ def complete(messages: list[dict], config) -> str:
                 url,
                 headers=headers,
                 json=payload,
-                timeout=60,
+                timeout=timeout,
             )
             if not response.is_success:
                 last_exc = Exception(

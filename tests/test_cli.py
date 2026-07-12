@@ -6,7 +6,7 @@ import pytest
 
 from voicelog import cli
 from voicelog.config import Config, DEFAULTS
-from voicelog.gitsource import GitResult
+from voicelog.gitsource import GitResult, RefNotFound
 from voicelog.models import Commit
 from voicelog.tts import TTSError
 
@@ -37,7 +37,7 @@ def wired(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cli.gitsource,
         "read_commits",
-        lambda n: GitResult(
+        lambda fallback_commits=50, since=None: GitResult(
             commits=[Commit("h", "feat: a thing", "", "Al", [])],
             used_fallback=False,
             tag="v1.0.0",
@@ -49,6 +49,8 @@ def wired(monkeypatch, tmp_path):
         "generate",
         lambda commits, voice_text, cfg: "## Unreleased\n\n### Features\n- A thing happened",
     )
+    # Spoken summary is a separate LLM call — stub it so tests stay offline.
+    monkeypatch.setattr(cli.generate, "summarize", lambda md, cfg, detail=False: "A short spoken summary.")
     monkeypatch.setattr("sys.argv", ["voicelog"])
 
 
@@ -97,8 +99,19 @@ def test_speaks_on_normal_run(wired, monkeypatch, capsys):
     assert called["spoke"] is True
 
 
-def test_voice_md_written(wired, monkeypatch, tmp_path):
+def test_default_run_does_not_write_voice_md(wired, monkeypatch, tmp_path):
+    """The default run is a transient rundown — no persistent changelog."""
     monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+
+    cli.main()
+
+    assert not (tmp_path / ".changelog" / "voice.md").exists()
+
+
+def test_changelog_flag_writes_voice_md(wired, monkeypatch, tmp_path):
+    """--changelog opts into the persistent release changelog."""
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--changelog"])
 
     cli.main()
 
@@ -124,6 +137,242 @@ def test_second_run_uses_cache_and_skips_generate(wired, monkeypatch):
     cli.main()  # should hit cache
 
     assert calls["n"] == 1
+
+
+def test_speaks_summary_not_full_changelog(wired, monkeypatch):
+    """Audio uses the short spoken summary, never the full rendered changelog."""
+    spoken = {}
+    monkeypatch.setattr(cli.generate, "summarize", lambda md, cfg, detail=False: "SUMMARY LINE")
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: spoken.setdefault("text", text))
+
+    cli.main()
+
+    assert spoken["text"] == "SUMMARY LINE"
+    assert "A thing happened" not in spoken["text"]
+
+
+def test_detail_flag_requests_detailed_summary(wired, monkeypatch):
+    seen = {}
+
+    def rec_summarize(md, cfg, detail=False):
+        seen["detail"] = detail
+        return "detailed spoken summary"
+
+    monkeypatch.setattr(cli.generate, "summarize", rec_summarize)
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--detail"])
+
+    cli.main()
+
+    assert seen["detail"] is True
+
+
+def test_summary_is_cached_across_runs(wired, monkeypatch):
+    """A repeat run with the same commits must NOT call summarize again."""
+    calls = {"n": 0}
+
+    def counting_summarize(md, cfg, detail=False):
+        calls["n"] += 1
+        return "spoken summary"
+
+    monkeypatch.setattr(cli.generate, "summarize", counting_summarize)
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+
+    cli.main()  # generates + caches summary
+    cli.main()  # should reuse cached summary
+
+    assert calls["n"] == 1
+
+
+def test_default_summary_is_brief(wired, monkeypatch):
+    seen = {}
+
+    def rec_summarize(md, cfg, detail=False):
+        seen["detail"] = detail
+        return "brief"
+
+    monkeypatch.setattr(cli.generate, "summarize", rec_summarize)
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+
+    cli.main()
+
+    assert seen["detail"] is False
+
+
+def test_summary_failure_skips_audio_but_still_prints(wired, monkeypatch, capsys):
+    """If the spoken summary can't be produced, text still prints and audio is skipped."""
+    def boom(md, cfg, detail=False):
+        raise cli.LLMError("summary model down")
+
+    spoke = {"called": False}
+    monkeypatch.setattr(cli.generate, "summarize", boom)
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: spoke.__setitem__("called", True))
+
+    cli.main()
+
+    out = capsys.readouterr()
+    assert "## Unreleased" in out.out
+    assert spoke["called"] is False
+    assert "warning" in out.err.lower()
+
+
+def test_caps_commits_for_large_repo(wired, monkeypatch, capsys):
+    """More than max_commits → only the most recent max_commits go to the model."""
+    cap = _config().max_commits
+    many = [Commit(f"h{i}", f"feat: thing {i}", "", "Al", []) for i in range(cap + 60)]
+    monkeypatch.setattr(
+        cli.gitsource,
+        "read_commits",
+        lambda fallback_commits=50, since=None: GitResult(commits=many, used_fallback=False, tag="v1.0.0"),
+    )
+    seen = {}
+
+    def recording_generate(commits, voice_text, cfg):
+        seen["n"] = len(commits)
+        return "## Unreleased\n\n- x"
+
+    monkeypatch.setattr(cli.generate, "generate", recording_generate)
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+
+    cli.main()
+
+    assert seen["n"] == cap  # capped at the default max_commits
+    assert "warning" in capsys.readouterr().err.lower()
+
+
+def test_pull_flag_reads_since_orig_head(wired, monkeypatch):
+    """--pull asks gitsource for commits since ORIG_HEAD."""
+    seen = {}
+
+    def rec(fallback_commits=50, since=None):
+        seen["since"] = since
+        return GitResult(
+            commits=[Commit("h", "feat: pulled thing", "", "Al", [])],
+            used_fallback=False,
+            tag=None,
+        )
+
+    monkeypatch.setattr(cli.gitsource, "read_commits", rec)
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--pull", "--no-speak"])
+
+    cli.main()
+
+    assert seen["since"] == "ORIG_HEAD"
+
+
+def test_pr_flag_uses_detected_base(wired, monkeypatch):
+    """--pr summarises commits since the auto-detected base branch."""
+    seen = {}
+
+    def rec(fallback_commits=50, since=None):
+        seen["since"] = since
+        return GitResult(commits=[Commit("h", "feat: pr work", "", "Al", [])], used_fallback=False, tag=None)
+
+    monkeypatch.setattr(cli.gitsource, "read_commits", rec)
+    monkeypatch.setattr(cli.gitsource, "detect_base_branch", lambda: "origin/main")
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--pr", "--no-speak"])
+
+    cli.main()
+
+    assert seen["since"] == "origin/main"
+
+
+def test_pr_with_explicit_base_uses_it(wired, monkeypatch):
+    """--pr develop compares against the given branch, skipping auto-detect."""
+    seen = {}
+
+    def rec(fallback_commits=50, since=None):
+        seen["since"] = since
+        return GitResult(commits=[Commit("h", "feat: x", "", "Al", [])], used_fallback=False, tag=None)
+
+    monkeypatch.setattr(cli.gitsource, "read_commits", rec)
+    # Auto-detect must NOT be consulted when a base is given.
+    monkeypatch.setattr(
+        cli.gitsource, "detect_base_branch",
+        lambda: (_ for _ in ()).throw(AssertionError("should not auto-detect")),
+    )
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--pr", "develop", "--no-speak"])
+
+    cli.main()
+
+    assert seen["since"] == "develop"
+
+
+def test_pr_no_base_exits_with_error(wired, monkeypatch, capsys):
+    monkeypatch.setattr(cli.gitsource, "detect_base_branch", lambda: None)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--pr", "--no-speak"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 1
+    assert "base branch" in capsys.readouterr().err.lower()
+
+
+def test_pr_mode_does_not_write_voice_md(wired, monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.gitsource, "detect_base_branch", lambda: "main")
+    monkeypatch.setattr(
+        cli.gitsource,
+        "read_commits",
+        lambda fallback_commits=50, since=None: GitResult(
+            commits=[Commit("h", "feat: x", "", "Al", [])], used_fallback=False, tag=None
+        ),
+    )
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+    # Even with --changelog, PR mode is transient and must not persist.
+    monkeypatch.setattr("sys.argv", ["voicelog", "--pr", "--changelog", "--no-speak"])
+
+    cli.main()
+
+    assert not (tmp_path / ".changelog" / "voice.md").exists()
+
+
+def test_since_flag_passes_ref(wired, monkeypatch):
+    seen = {}
+
+    def rec(fallback_commits=50, since=None):
+        seen["since"] = since
+        return GitResult(commits=[Commit("h", "feat: x", "", "Al", [])], used_fallback=False, tag=None)
+
+    monkeypatch.setattr(cli.gitsource, "read_commits", rec)
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--since", "main", "--no-speak"])
+
+    cli.main()
+
+    assert seen["since"] == "main"
+
+
+def test_pull_mode_does_not_write_voice_md(wired, monkeypatch, tmp_path):
+    """Diff/pull mode is transient — it must not touch the release changelog."""
+    monkeypatch.setattr(
+        cli.gitsource,
+        "read_commits",
+        lambda fallback_commits=50, since=None: GitResult(
+            commits=[Commit("h", "feat: pulled", "", "Al", [])], used_fallback=False, tag=None
+        ),
+    )
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--pull", "--no-speak"])
+
+    cli.main()
+
+    assert not (tmp_path / ".changelog" / "voice.md").exists()
+
+
+def test_invalid_since_ref_exits_with_error(wired, monkeypatch, capsys):
+    def rec(fallback_commits=50, since=None):
+        raise RefNotFound(since)
+
+    monkeypatch.setattr(cli.gitsource, "read_commits", rec)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--since", "bogusref", "--no-speak"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 1
+    assert "bogusref" in capsys.readouterr().err
 
 
 def test_fresh_flag_bypasses_cache(wired, monkeypatch):

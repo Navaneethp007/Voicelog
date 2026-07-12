@@ -1,7 +1,7 @@
 """Tests for voicelog.cache — generation cache keyed on the commit set."""
 from __future__ import annotations
 
-from voicelog.cache import cache_key, get, put
+from voicelog.cache import cache_key, get, put, get_summary, put_summary
 from voicelog.models import Commit
 
 
@@ -77,3 +77,46 @@ def test_put_overwrites_previous(tmp_path):
 def test_cache_file_lives_under_changelog_dir(tmp_path):
     put(str(tmp_path), "k", "v")
     assert (tmp_path / ".changelog" / ".voicelog-cache.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# summary cache (keyed on the changelog key + detail level)
+# ---------------------------------------------------------------------------
+
+def test_get_summary_missing_returns_none(tmp_path):
+    put(str(tmp_path), "k", "md")
+    assert get_summary(str(tmp_path), "k", detail=False) is None
+
+
+def test_put_then_get_summary_roundtrip(tmp_path):
+    put(str(tmp_path), "k", "md")
+    put_summary(str(tmp_path), "k", False, "brief spoken")
+    assert get_summary(str(tmp_path), "k", detail=False) == "brief spoken"
+
+
+def test_summary_is_keyed_on_detail(tmp_path):
+    put(str(tmp_path), "k", "md")
+    put_summary(str(tmp_path), "k", False, "brief one")
+    put_summary(str(tmp_path), "k", True, "detailed one")
+    assert get_summary(str(tmp_path), "k", detail=False) == "brief one"
+    assert get_summary(str(tmp_path), "k", detail=True) == "detailed one"
+
+
+def test_put_summary_preserves_markdown(tmp_path):
+    put(str(tmp_path), "k", "the markdown")
+    put_summary(str(tmp_path), "k", False, "spoken")
+    assert get(str(tmp_path), "k") == "the markdown"
+
+
+def test_new_markdown_invalidates_summaries(tmp_path):
+    put(str(tmp_path), "k", "md1")
+    put_summary(str(tmp_path), "k", False, "spoken for md1")
+    put(str(tmp_path), "k2", "md2")  # new commit set → new key
+    assert get_summary(str(tmp_path), "k2", detail=False) is None
+    assert get_summary(str(tmp_path), "k", detail=False) is None
+
+
+def test_get_summary_wrong_key_returns_none(tmp_path):
+    put(str(tmp_path), "k", "md")
+    put_summary(str(tmp_path), "k", False, "spoken")
+    assert get_summary(str(tmp_path), "other", detail=False) is None

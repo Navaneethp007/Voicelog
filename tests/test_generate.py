@@ -12,7 +12,7 @@ import pytest
 from voicelog.models import Commit
 from voicelog.config import Config, DEFAULTS
 from voicelog.llm import complete, MissingApiKey, LLMError
-from voicelog.generate import generate
+from voicelog.generate import generate, summarize
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +104,33 @@ def test_generate_reraises_missing_api_key(sample_commits, config):
 
 
 # ===========================================================================
+# summarize() — the short spoken digest
+# ===========================================================================
+
+def test_summarize_returns_spoken_text(config):
+    changelog = "## Unreleased\n\n### Features\n- Added PDF export"
+    with patch("voicelog.generate.llm.complete", return_value="Three features and two fixes.") as mock:
+        result = summarize(changelog, config)
+    assert result == "Three features and two fixes."
+    mock.assert_called_once()
+
+
+def test_summarize_empty_raises_llmerror(config):
+    with patch("voicelog.generate.llm.complete", return_value="   "):
+        with pytest.raises(LLMError):
+            summarize("## Unreleased\n\n- x", config)
+
+
+def test_summarize_strips_think_block(config):
+    reply = "<think>let me reason</think>Two fixes and a new export option."
+    with patch("voicelog.generate.llm.complete", return_value=reply):
+        result = summarize("## Unreleased\n\n- x", config)
+    assert "<think>" not in result
+    assert "let me reason" not in result
+    assert "Two fixes and a new export option." in result
+
+
+# ===========================================================================
 # llm.py behaviour tests  (tests 6–10)
 # ===========================================================================
 
@@ -115,7 +142,37 @@ def test_complete_raises_missing_api_key_when_env_var_absent(config):
         with pytest.raises(MissingApiKey) as exc_info:
             complete(messages, config)
     assert "NVIDIA_API_KEY" in str(exc_info.value)
-    assert "https://build.nvidia.com" in str(exc_info.value)
+
+
+# 6b. Reads the API key from the env var named in config.api_key_env
+def test_complete_uses_configured_key_env(config):
+    import dataclasses
+    cfg = dataclasses.replace(config, api_key_env="MY_PROVIDER_KEY")
+    messages = [{"role": "user", "content": "Hello"}]
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.is_success = True
+    mock_response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+
+    env = {"MY_PROVIDER_KEY": "abc123"}  # NVIDIA_API_KEY intentionally absent
+    with patch.dict(os.environ, env, clear=True):
+        with patch("voicelog.llm.httpx.post", return_value=mock_response) as mock_post:
+            result = complete(messages, cfg)
+
+    assert result == "ok"
+    _, kwargs = mock_post.call_args
+    assert kwargs["headers"]["Authorization"] == "Bearer abc123"
+
+
+# 6c. MissingApiKey names the configured env var
+def test_missing_key_message_names_configured_env(config):
+    import dataclasses
+    cfg = dataclasses.replace(config, api_key_env="OPENAI_API_KEY")
+    with patch.dict(os.environ, {}, clear=True):
+        with pytest.raises(MissingApiKey) as exc:
+            complete([{"role": "user", "content": "x"}], cfg)
+    assert "OPENAI_API_KEY" in str(exc.value)
 
 
 # 7. httpx returns success → complete returns the content string
@@ -197,6 +254,8 @@ def test_complete_sends_correct_request_body(config):
     assert body.get("messages") == messages
     assert "temperature" in body
     assert "max_tokens" in body
+    # The request deadline comes from config, not a hardcoded value.
+    assert call_kwargs.get("timeout") == config.llm_timeout
 
 
 # 11. A 200 with a non-OpenAI body falls back to LLMError instead of crashing.

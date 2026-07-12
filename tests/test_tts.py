@@ -101,16 +101,24 @@ class FakeConfig:
     tts_voice = "Some.Voice"
     tts_language = "en-US"
     tts_sample_rate = 44100
+    tts_timeout = 90.0
+    tts_api_key_env = "NVIDIA_API_KEY"
 
 
 def _make_fake_riva():
-    """Return a fake riva.client module + AudioEncoding."""
+    """Return a fake riva.client module + AudioEncoding.
+
+    synthesize(future=True) returns a call object whose .result(timeout=...)
+    yields the response — mirroring the real gRPC future interface.
+    """
     fake_riva = types.SimpleNamespace()
     fake_riva.Auth = mock.MagicMock(name="Auth")
 
     resp = types.SimpleNamespace(audio=b"\x01\x02\x03\x04")
+    call = mock.MagicMock(name="Call")
+    call.result.return_value = resp
     service = mock.MagicMock(name="Service")
-    service.synthesize.return_value = resp
+    service.synthesize.return_value = call
     fake_riva.SpeechSynthesisService = mock.MagicMock(return_value=service)
 
     fake_encoding = types.SimpleNamespace(LINEAR_PCM=1)
@@ -121,6 +129,26 @@ def test_speak_missing_api_key_raises(monkeypatch):
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
     with pytest.raises(TTSError):
         tts.speak("Hello world", FakeConfig())
+
+
+def test_speak_reads_configured_key_env(monkeypatch):
+    """TTS reads the key from the env var named in config.tts_api_key_env."""
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setenv("RIVA_KEY", "riva-abc")
+
+    class Cfg(FakeConfig):
+        tts_api_key_env = "RIVA_KEY"
+
+    fake_riva, fake_encoding, service = _make_fake_riva()
+    monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
+    monkeypatch.setattr(tts, "_play", lambda path: None)
+
+    tts.speak("Hello there.", Cfg())
+
+    # The configured key reached the auth metadata as a Bearer token.
+    _, auth_kwargs = fake_riva.Auth.call_args
+    meta = dict((k, v) for k, v in auth_kwargs["metadata_args"])
+    assert meta["authorization"] == "Bearer riva-abc"
 
 
 def test_speak_import_failure_raises_with_hint(monkeypatch):
@@ -162,6 +190,11 @@ def test_speak_happy_path(monkeypatch):
     assert kwargs["voice_name"] == cfg.tts_voice
     assert kwargs["language_code"] == cfg.tts_language
     assert kwargs["sample_rate_hz"] == cfg.tts_sample_rate
+    # Uses the async future path so a deadline can be enforced.
+    assert kwargs["future"] is True
+    call = service.synthesize.return_value
+    _, result_kwargs = call.result.call_args
+    assert result_kwargs["timeout"] == cfg.tts_timeout
     assert len(played) == 1
 
 
@@ -175,3 +208,20 @@ def test_speak_synthesize_exception_raises(monkeypatch):
     with pytest.raises(TTSError) as exc:
         tts.speak("Hello there.", FakeConfig())
     assert "grpc boom" in str(exc.value)
+
+
+def test_speak_timeout_raises_clean_error(monkeypatch):
+    """A hung synthesis call is bounded by tts_timeout and raises TTSError."""
+    import grpc
+
+    monkeypatch.setenv("NVIDIA_API_KEY", "key")
+    fake_riva, fake_encoding, service = _make_fake_riva()
+    service.synthesize.return_value.result.side_effect = grpc.FutureTimeoutError()
+    monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
+    monkeypatch.setattr(tts, "_play", lambda path: None)
+
+    with pytest.raises(TTSError) as exc:
+        tts.speak("Hello there.", FakeConfig())
+    assert "timed out" in str(exc.value).lower()
+    # The hung call is cancelled so the channel isn't left dangling.
+    service.synthesize.return_value.cancel.assert_called_once()

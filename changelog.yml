@@ -1,11 +1,35 @@
 # voicelog configuration
 # All fields are optional — built-in defaults are used for anything not listed here.
 
-# LLM provider settings
+# LLM provider settings — any OpenAI-compatible endpoint works.
+# The API key is read from the environment variable named by `api_key_env`
+# (never stored in this file). Presets:
+#
+#   NVIDIA (default):
+#     base_url: https://integrate.api.nvidia.com/v1
+#     model:    mistralai/mistral-medium-3.5-128b   # or meta/llama-3.1-8b-instruct (faster)
+#     api_key_env: NVIDIA_API_KEY
+#
+#   OpenAI:
+#     base_url: https://api.openai.com/v1
+#     model:    gpt-4o-mini
+#     api_key_env: OPENAI_API_KEY
+#
+#   Groq (fast, free tier):
+#     base_url: https://api.groq.com/openai/v1
+#     model:    llama-3.1-8b-instant
+#     api_key_env: GROQ_API_KEY
+#
+#   Ollama (local, no key):
+#     base_url: http://localhost:11434/v1
+#     model:    llama3.1
+#     api_key_env: OLLAMA_KEY   # any name; set it to a dummy value
+#
 provider: nvidia
 base_url: https://integrate.api.nvidia.com/v1
-model: mistralai/mistral-medium-3.5-128b # any model on build.nvidia.com
-# API key is read from the NVIDIA_API_KEY environment variable — never stored here.
+model: mistralai/mistral-medium-3.5-128b
+api_key_env: NVIDIA_API_KEY
+llm_timeout: 120  # seconds to wait for the model before failing over to the raw commit list
 
 # Sections that will appear in the generated changelog (in this order).
 # Commits are grouped into these sections by the model.
@@ -29,13 +53,28 @@ voice_samples: .changelog/voice/
 # Number of commits to use when no prior tag exists in the repo.
 fallback_commits: 50
 
+# On very large ranges, only the most recent N commits are sent to the model
+# (keeps generation fast and cheap). The full changelog still covers these.
+max_commits: 50
+
 # --- Speech: the log talks to you (NVIDIA Riva TTS) ---
-# Every run prints the changelog AND reads it aloud. Reuses NVIDIA_API_KEY.
+# Every run prints the changelog AND reads it aloud.
+# NOTE: speech is NVIDIA Riva only, so it always needs an NVIDIA key — even if
+# your text LLM above is OpenAI/Groq/etc. tts_api_key_env names that env var.
+# If you don't have an NVIDIA key, set `speak: false` (text still works).
 speak: true
+tts_api_key_env: NVIDIA_API_KEY
+
+# How much the spoken summary says: "brief" (2-3 sentences) or "detailed"
+# (a fuller walkthrough). --detail on the CLI forces detailed for one run.
+speech_detail: brief
 tts_function_id: 877104f7-e885-42b9-8de8-f6e4c6303969  # magpie-tts-multilingual
 tts_voice: Magpie-Multilingual.EN-US.Sofia
 tts_language: en-US
 tts_sample_rate: 44100
+tts_timeout: 90        # seconds per speech request before giving up (avoids hangs)
 
-# Persistent casual changelog maintained across releases.
+# By default voicelog gives a transient rundown (print + speak). Set this true
+# (or pass --changelog) to ALSO maintain a persistent release changelog.
+write_changelog: false
 voice_md: .changelog/voice.md

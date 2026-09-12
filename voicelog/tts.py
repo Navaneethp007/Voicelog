@@ -16,6 +16,8 @@ import wave
 
 import httpx
 
+from voicelog.redact import redact
+
 
 class TTSError(Exception):
     """Raised when speech synthesis or playback fails."""
@@ -191,7 +193,9 @@ def _synth_riva(chunks: list[str], api_key: str, config) -> tuple[bytes, int]:
     except TTSError:
         raise
     except Exception as exc:
-        raise TTSError(str(exc)) from exc
+        # Broad by design, and it wraps the Auth construction that is handed the
+        # key - so scrub before the message escapes.
+        raise TTSError(redact(str(exc), api_key)) from exc
 
     return bytes(pcm), rate
 
@@ -214,7 +218,12 @@ def _synth_openai(chunks: list[str], api_key: str, config) -> tuple[bytes, int]:
                 timeout=timeout,
             )
             if not resp.is_success:
-                raise TTSError(f"OpenAI TTS HTTP {resp.status_code}: {resp.text[:200]}")
+                # Redact before truncating: cutting first strands a key
+                # prefix that no later replace() can match.
+                raise TTSError(
+                    f"OpenAI TTS HTTP {resp.status_code}: "
+                    f"{redact(resp.text, api_key)[:200]}"
+                )
             pcm.extend(resp.content)
         except TTSError:
             raise
@@ -244,7 +253,10 @@ def _synth_elevenlabs(chunks: list[str], api_key: str, config) -> tuple[bytes, i
                 timeout=timeout,
             )
             if not resp.is_success:
-                raise TTSError(f"ElevenLabs HTTP {resp.status_code}: {resp.text[:200]}")
+                raise TTSError(
+                    f"ElevenLabs HTTP {resp.status_code}: "
+                    f"{redact(resp.text, api_key)[:200]}"
+                )
             pcm.extend(resp.content)
         except TTSError:
             raise

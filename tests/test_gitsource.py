@@ -16,8 +16,9 @@ from voicelog.gitsource import (
     read_commits,
     read_recent_commits,
     detect_base_branch,
+    head_sha,
+    is_ancestor,
 )
-from voicelog.models import Commit
 
 
 # ---------------------------------------------------------------------------
@@ -612,3 +613,76 @@ class TestCommitFields:
         result = read_commits()
 
         assert result.commits[0].author == "Test"
+
+
+class TestHeadSha:
+    """head_sha / is_ancestor - the watermark's two git primitives."""
+
+    def test_returns_the_full_head_sha(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, message="feat: one")
+        monkeypatch.chdir(repo)
+
+        sha = head_sha()
+
+        assert sha is not None
+        assert len(sha) == 40
+        assert sha == run("git", "rev-parse", "HEAD").stdout.strip()
+
+    def test_returns_none_in_an_empty_repo(self, tmp_path, monkeypatch):
+        repo, _ = make_repo(tmp_path)  # git init, no commits
+        monkeypatch.chdir(repo)
+
+        assert head_sha() is None
+
+    def test_returns_none_outside_a_repo(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        assert head_sha() is None
+
+
+class TestIsAncestor:
+    def test_a_parent_is_an_ancestor_of_head(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, filename="a.txt", message="feat: one")
+        first = run("git", "rev-parse", "HEAD").stdout.strip()
+        add_commit(run, repo, filename="b.txt", message="feat: two")
+        monkeypatch.chdir(repo)
+
+        assert is_ancestor(first) is True
+
+    def test_head_is_its_own_ancestor(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, message="feat: one")
+        monkeypatch.chdir(repo)
+
+        assert is_ancestor(run("git", "rev-parse", "HEAD").stdout.strip()) is True
+
+    def test_a_descendant_is_not_an_ancestor(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, filename="a.txt", message="feat: one")
+        add_commit(run, repo, filename="b.txt", message="feat: two")
+        head = run("git", "rev-parse", "HEAD").stdout.strip()
+        monkeypatch.chdir(repo)
+
+        assert is_ancestor(head, "HEAD~1") is False
+
+    def test_an_unknown_sha_is_not_an_ancestor(self, tmp_path, monkeypatch):
+        """git exits 128 for "no such commit" and 1 for "no" - both mean no.
+        This is the case that used to reach read_commits and exit 1."""
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, message="feat: one")
+        monkeypatch.chdir(repo)
+
+        assert is_ancestor("0" * 40) is False
+
+    def test_a_commit_from_another_branch_is_not_an_ancestor(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, filename="a.txt", message="feat: base")
+        run("git", "checkout", "-b", "feature")
+        add_commit(run, repo, filename="f.txt", message="feat: only on feature")
+        feature_head = run("git", "rev-parse", "HEAD").stdout.strip()
+        run("git", "checkout", "-")
+        monkeypatch.chdir(repo)
+
+        assert is_ancestor(feature_head) is False

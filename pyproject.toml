@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voicelog"
-version = "0.2.0"
+version = "0.3.0"
 description = "A CLI that gives you a spoken and written rundown of your git changes"
 readme = "README.md"
 requires-python = ">=3.10"

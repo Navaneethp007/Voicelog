@@ -6,7 +6,7 @@
 
 ```bash
 pip install voicelog            # core (text rundown; also all you need for OpenAI/ElevenLabs speech)
-pip install "voicelog[tts]"     # + NVIDIA Riva TTS support (only needed for the riva provider)
+pip install "voicelog[tts]"     # + NVIDIA Riva TTS support (setup can also install this for you)
 ```
 
 Requires Python 3.10+. Speech playback works on Windows, macOS, and Linux (via `winsound`, `afplay`, and `paplay`/`aplay`/`ffplay` respectively). The `[tts]` extra pulls in NVIDIA's gRPC client — only needed if you use `tts_provider: riva` (the default). If you set `tts_provider: openai` or `elevenlabs`, plain `pip install voicelog` is enough since those just use HTTP.
@@ -28,21 +28,37 @@ pytest
 ```
 </details>
 
-## Setup — one API key
+## Setup — run it once
 
-voicelog needs a free API key from [build.nvidia.com](https://build.nvidia.com) (no credit card). You can either let voicelog ask you on first run, or set it yourself.
+**Just run `voicelog`.** On a machine with nothing configured it walks you through setup: pick a provider, paste your API key, pick a model from that provider's live catalog (searchable, or type an id), pick a voice. Then it carries on and prints the changelog you asked for.
 
-**Easiest:** just run `voicelog` in a repo — if no key is set, it prompts you to paste one and uses it for that session.
+Most steps take the default, so setup is mostly pressing Enter. The model you choose is checked with one tiny request before setup finishes — being listed in a provider's catalog doesn't guarantee your account may *call* it, and finding that out during setup beats finding out on your first real run.
 
-**Or set it manually** (the same key powers text and speech):
+Re-run it any time with `voicelog --setup`.
+
+Your answers are saved per-machine, so **every repo you work in inherits them** — you configure once, not once per project:
+
+| Platform | User config |
+|----------|-------------|
+| Windows | `%APPDATA%\voicelog\config.yml` |
+| macOS / Linux | `~/.config/voicelog/config.yml` (honours `$XDG_CONFIG_HOME`) |
+
+Set `VOICELOG_CONFIG_HOME` to put it somewhere else.
+
+**Your API key is never written to that file** — only the *name* of the environment variable it lives in. Setup puts the key in the current session and prints the command to keep it:
 
 ```bash
 export NVIDIA_API_KEY=nvapi-...     # bash / macOS / Linux
 set NVIDIA_API_KEY=nvapi-...        # Windows cmd (this session)
 $env:NVIDIA_API_KEY = "nvapi-..."   # PowerShell (this session)
+setx NVIDIA_API_KEY "nvapi-..."     # Windows, every future terminal
 ```
 
-To persist it on Windows so every terminal has it: `setx NVIDIA_API_KEY "nvapi-..."` (then open a new terminal).
+A free key from [build.nvidia.com](https://build.nvidia.com) needs no credit card, but any provider below works.
+
+**voicelog ships no default model.** You pick one during setup, because provider model ids get retired — NVIDIA retired the model voicelog used to default to, and every run on a default config quietly fell back to a plain commit list. Nothing voicelog ships can go stale that way now.
+
+Non-interactive environments (CI, git hooks, pipes) never see a prompt: setup is skipped, and a run with no model configured prints how to fix it and falls back to the commit list rather than failing your build.
 
 ## Usage
 
@@ -56,9 +72,30 @@ voicelog --no-speak
 # Ignore the cache and regenerate fresh prose from the model
 voicelog --fresh
 
-# Use an alternate config file
+# Use an alternate config file (ignores your user config, for reproducible runs)
 voicelog --config path/to/changelog.yml
+
+# Summarise only what arrived since voicelog last looked
+voicelog --since-last
+
+# Missed the audio? Re-play the last run - free, offline, no model call
+voicelog --replay
+
+# Re-run setup
+voicelog --setup
+
+# Override provider/model/voice for a single run, without touching your config
+voicelog --model meta/llama-3.3-70b-instruct
+voicelog --provider groq
+voicelog --provider ollama --model llama3.1     # local, no key needed
+voicelog --tts-provider openai --voice nova
+voicelog --provider custom --base-url https://my-proxy/v1 --api-key-env MY_KEY
 ```
+
+Switching provider takes that provider's endpoint and key env var with it; *restating*
+the provider you already use changes nothing, so a hand-edited `base_url` survives
+`--provider nvidia`. A switch keeps whatever `model` your config names and says so —
+pass `--model` to change it too.
 
 ### Catch up on a `git pull`
 
@@ -122,7 +159,9 @@ Set `speech_detail: detailed` in `changelog.yml` to make it the default. (The pr
 
 ### Caching
 
-The generated changelog is cached on the **set of commits** (in `.changelog/.voicelog-cache.json`). Re-running with the same commits returns the cached text instead of calling the model again — so repeat runs are free, fast, and don't churn `voice.md`. Add a new commit (or pass `--fresh`) to regenerate. You'll usually want to git-ignore the cache file.
+The generated changelog is cached on the **set of commits**. Re-running with the same commits returns the cached text instead of calling the model again — so repeat runs are free, fast, and don't churn `voice.md`. Add a new commit (or pass `--fresh`) to regenerate.
+
+The cache and the run watermark live in your repo's git directory (`.git/voicelog/`), not in the work tree — so there is nothing to git-ignore, nothing to commit by accident, and the same file is used whichever subdirectory you run from. **voicelog writes nothing into your repo unless you ask for `--changelog`.** Upgrading from 0.2.x leaves a stale `.changelog/.voicelog-cache.json` behind; it is safe to delete.
 
 By default, each run is a **transient rundown** — it prints the casual changelog and reads a short spoken summary aloud, but doesn't write anything. That's the everyday use: quick "what changed" at a git moment.
 
@@ -136,6 +175,36 @@ Add `--changelog` (or set `write_changelog: true`) to *also* maintain a persiste
 
 For big histories (e.g. a fork with hundreds of commits since the last tag), voicelog caps how many commits it sends to the model — the most recent `max_commits` (default 50) — so generation stays fast and cheap. The spoken part is always a short summary, so it never gets stuck reading a giant changelog aloud. Tune `max_commits` in `changelog.yml`, or use `--no-speak` for instant text-only output.
 
+### Picking up where you left off
+
+```bash
+voicelog --since-last
+```
+
+Summarises only what has arrived since voicelog last summarised this repo. Useful in a project with
+no tags, where the default range is "the last 50 commits" and every run therefore says the same
+thing.
+
+The watermark advances only when a run actually printed a summary — not when it fell back to a raw
+commit list, and not for the one-off ranges (`--pull`, `--pr`, `--since`), since those show a slice
+the watermark never covered. If the stored commit is no longer in your branch's history (a rebase, a
+reset, a shallow clone), voicelog says so and shows the default range instead of failing. Like the
+other range modes it is transient: it never writes the release changelog.
+
+### Missed the audio?
+
+```bash
+voicelog --replay
+```
+
+Re-prints the last run and re-speaks its summary, straight from the cache: no model call, no git
+range, nothing recorded. It exists because the watermark records that a summary was *printed*, not
+that it was *heard* — if the audio failed, or you stepped away, `--since-last` correctly reports
+nothing new and the run you missed would otherwise be gone.
+
+Because it replays rather than regenerates, you get the exact words you missed, not a paraphrase.
+**Only the most recent run is kept**, so the next `voicelog` run in that repo replaces it.
+
 ## Persistent changelog (`.changelog/voice.md`)
 
 voicelog maintains this file for you:
@@ -144,18 +213,23 @@ voicelog maintains this file for you:
 
 ## Using your own LLM
 
-voicelog talks to any **OpenAI-compatible** endpoint. Set three things in `changelog.yml` — `base_url`, `model`, and `api_key_env` (the name of the env var your key lives in) — then export that key. The key is never stored in the file.
+voicelog talks to any **OpenAI-compatible** endpoint. `voicelog --setup` offers these presets, lists each one's live models for you to choose from, and checks that your pick actually answers; you can also set `base_url`, `model` and `api_key_env` by hand. The key is never stored in either config file.
 
-| Provider | base_url | model | api_key_env |
-|----------|----------|-------|-------------|
-| NVIDIA (default) | `https://integrate.api.nvidia.com/v1` | `mistralai/mistral-medium-3.5-128b` | `NVIDIA_API_KEY` |
-| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` | `OPENAI_API_KEY` |
-| Groq (fast, free tier) | `https://api.groq.com/openai/v1` | `llama-3.1-8b-instant` | `GROQ_API_KEY` |
-| Ollama (local, no key) | `http://localhost:11434/v1` | `llama3.1` | any name |
+| Provider | base_url | api_key_env | Model ids |
+|----------|----------|-------------|-----------|
+| NVIDIA (default) | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` | [build.nvidia.com](https://build.nvidia.com) |
+
+Reasoning models (OpenAI's o-series, gpt-5) work too: they reject the parameters most tools send, so voicelog asks the provider what it wants and retries — no model allowlist to go stale.
+| OpenAI | `https://api.openai.com/v1` | `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com/docs/models) |
+| Groq (fast, free tier) | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | [console.groq.com](https://console.groq.com/docs/models) |
+| OpenRouter (one key, many providers) | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | [openrouter.ai/models](https://openrouter.ai/models) |
+| Ollama (local, no key) | `http://127.0.0.1:11434/v1` | *(leave blank — none needed)* | whatever you have pulled |
+
+The model column is deliberately a link rather than a value: setup reads each provider's `/v1/models` at the moment you run it, so the list is never out of date. Anything else OpenAI-compatible works too — pick "Other" and paste its base URL.
 
 ## Using your own voice
 
-The spoken part is just as configurable — set `tts_provider` in `changelog.yml`. All three work cross-platform (Windows/macOS/Linux) and are independent of your text LLM choice above (mix and match freely, e.g. Groq for text + ElevenLabs for voice).
+The spoken part is just as configurable — `voicelog --setup` asks, or set `tts_provider` in a config file, or pass `--tts-provider` / `--voice` for one run. Riva is the only backend needing an extra package (it speaks gRPC, not HTTP); if you pick it and don't have it, setup offers to `pip install` it for you and carries on either way. Setup puts the speech service matching your text provider first, but every service stays selectable: pairing Groq for text with ElevenLabs for speech is supported, and Groq, OpenRouter and Ollama have no speech service of their own. All three work cross-platform (Windows/macOS/Linux) and are independent of your text LLM choice above (mix and match freely, e.g. Groq for text + ElevenLabs for voice).
 
 | Provider | tts_provider | tts_voice | tts_api_key_env |
 |----------|--------------|-----------|------------------|
@@ -167,26 +241,55 @@ No key for any of them? Set `speak: false` — the text changelog still works ev
 
 ## Configuration
 
-Copy `changelog.yml` and edit it — all fields are optional, built-in defaults work out of the box. Key fields:
+Settings come from four layers, each overriding the one before:
+
+```
+built-in defaults  <  your user config  <  the project's ./changelog.yml  <  CLI flags
+```
+
+That split is the point: **which provider, model, key and voice you use is personal**, so it lives in your user config and follows you between repos. **Which sections a changelog has, what commit noise to drop** and where voice samples live are properties of a project, so they belong in a `changelog.yml` that project can commit — without carrying anyone's model choice or key.
+
+`--config PATH` replaces both discovered files, so a pinned config means the same thing on every machine.
+
+All fields are optional. Key ones:
 
 | Field | Purpose |
 |-------|---------|
-| `model` | Any model on build.nvidia.com (default mistral-medium) |
+| `provider` | Preset name: `nvidia`, `openai`, `groq`, `openrouter`, `ollama`, `custom` |
+| `base_url` | OpenAI-compatible endpoint |
+| `api_key_env` | Name of the env var holding your key (blank = endpoint needs none) |
+| `model` | Model id at your provider — **no default**; set by `voicelog --setup` or `--model` |
 | `sections` | Section grouping for the changelog |
 | `noise` | Regex commit subjects to drop (e.g. `^wip`) |
 | `speak` | `true`/`false` — read aloud (also `--no-speak` per run) |
 | `tts_provider` | `riva` / `openai` / `elevenlabs` |
 | `tts_voice` | Voice id/name — meaning depends on the provider |
-| `voice_md` | Path to the persistent changelog |
+| `voice_md` | Path to the persistent changelog, relative to the repo |
 | `max_commits` | Cap on commits sent to the model for normal ranges |
 | `onboard_commits` | Recent commits `--new` reads (ignores tags) |
 
-Every secret is read from an environment variable named in the config (`api_key_env` for text, `tts_api_key_env` for speech) — never stored in the file itself.
+Config values are checked when they load, so a typo names itself — the file, the setting and the
+value — instead of failing somewhere downstream. When the bad value is in *your* config, `voicelog
+--setup` repairs it by dropping the unusable setting; when it is in a project's `changelog.yml`,
+voicelog says so rather than pretending the wizard can fix a file it never writes. That matters most for the quiet ones: `noise: ^wip`
+written as a bare string used to become four one-character patterns that discarded every commit, and
+`voice_samples: ~/voice/` silently loaded nothing at all.
+
+Every secret is read from an environment variable named in the config (`api_key_env` for text, `tts_api_key_env` for speech) — never stored in either config file, including the one `voicelog --setup` writes. If text and speech use different providers, setup asks for both keys.
+
+### Output styling
+
+On a terminal, headings, `**bold**` and `` `code` `` are rendered with bold, underline and dim
+rather than printed as markdown source. Piped or redirected output is left exactly as it was — plain
+markdown — so `voicelog > NOTES.md` still produces a file you can commit. Set `NO_COLOR` to turn
+styling off, or `FORCE_COLOR` to keep it through a pipe.
 
 ## Graceful degradation
 
-voicelog never blocks on audio. Text always prints first; if anything downstream fails it only warns to stderr:
-- **LLM unavailable** → prints a plain bulleted commit list instead.
+voicelog never blocks on audio, and never fails your build. Text always prints first; if anything downstream fails it only warns to stderr:
+- **LLM unavailable** (timeout, 5xx, rate limit) → retries once, then prints a plain bulleted commit list instead.
+- **No model configured** → says to run `voicelog --setup`, then prints the commit list. Exit code stays 0, so pre-push hooks and CI keep working.
+- **Model retired or unknown** (HTTP 404/410) → names the model, the endpoint and `voicelog --setup`, then prints the commit list. Reported as a configuration problem rather than an outage, because that is what it is — a retired model hiding behind a generic "LLM unavailable" warning is how the old default model stayed broken unnoticed.
 - **TTS misconfigured / key missing / no audio player / synthesis error** → prints text, warns, skips speech.
 
 ## Architecture
@@ -198,9 +301,11 @@ gitsource → filters → voice → prompt → llm → render → cli ─┬─ 
   (or readme +                                            ├─ voicefile (.changelog/voice.md, opt-in)
    read_recent_commits                                     └─ tts (speak aloud)
    for --new)
+
+cli --setup → wizard → providers (GET /v1/models) → config.save_user_config
 ```
 
-`llm` and `tts` are the only provider-aware modules. Swapping provider/model/voice is a config change, never a code change.
+`llm`, `tts` and `providers` are the only provider-aware modules, and `wizard` is the only interactive one. Swapping provider/model/voice is a config change, never a code change.
 
 ## Tests
 

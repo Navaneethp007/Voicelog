@@ -201,3 +201,32 @@ def test_tag_removed_uses_archived_fallback(tmp_path):
     assert content.splitlines()[0] == "<!-- voicelog:last-tag=none -->"
     assert "## Unreleased (archived)" in content
     assert "- orphaned work" in content
+
+
+# ---------------------------------------------------------------------------
+# The configured path is honoured
+# ---------------------------------------------------------------------------
+
+def test_rel_path_overrides_the_default_location(tmp_path):
+    """`voice_md` was loaded and documented but never read - the path was
+    hardcoded, so setting it did nothing."""
+    changed = update_voice_md(str(tmp_path), "## Unreleased\n\n- a thing\n", "v1.0.0",
+                              rel_path="docs/NOTES.md")
+
+    assert changed is True
+    content = (tmp_path / "docs" / "NOTES.md").read_text(encoding="utf-8")
+    assert "- a thing" in content
+    assert not (tmp_path / ".changelog" / "voice.md").exists()
+
+
+def test_a_blank_rel_path_falls_back_to_the_default(tmp_path):
+    update_voice_md(str(tmp_path), "## Unreleased\n\n- a thing\n", None, rel_path="")
+
+    assert (tmp_path / ".changelog" / "voice.md").exists()
+
+
+def test_the_default_location_is_unchanged(tmp_path):
+    """19 existing call sites pass three positional arguments; they must work."""
+    update_voice_md(str(tmp_path), "## Unreleased\n\n- a thing\n", None)
+
+    assert (tmp_path / ".changelog" / "voice.md").exists()

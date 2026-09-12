@@ -11,7 +11,9 @@ import pytest
 
 from voicelog.models import Commit
 from voicelog.config import Config, DEFAULTS
-from voicelog.llm import complete, MissingApiKey, LLMError
+from voicelog.llm import (
+    complete, MissingApiKey, LLMError, MissingModel, ModelUnavailable, InvalidApiKey,
+)
 from voicelog.generate import generate, summarize, onboard
 
 
@@ -24,7 +26,7 @@ def config():
     return Config(
         provider=DEFAULTS["provider"],
         base_url=DEFAULTS["base_url"],
-        model=DEFAULTS["model"],
+        model="test-model",  # never DEFAULTS["model"]: there is no default model
         sections=list(DEFAULTS["sections"]),
         noise=list(DEFAULTS["noise"]),
         voice_samples=DEFAULTS["voice_samples"],
@@ -357,3 +359,410 @@ def test_complete_falls_back_on_malformed_200(config):
 
     # Malformed body is treated like any failure: one retry, then LLMError.
     assert mock_post.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# No model configured
+# ---------------------------------------------------------------------------
+
+def test_complete_raises_missing_model_when_model_is_blank(config, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    config.model = ""
+
+    with patch("voicelog.llm.httpx.post") as post:
+        with pytest.raises(MissingModel):
+            complete([{"role": "user", "content": "x"}], config)
+
+    post.assert_not_called()  # never spend a request on a config error
+
+
+def test_missing_model_message_points_at_setup(config, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    config.model = "   "  # whitespace is not a model
+
+    with pytest.raises(MissingModel) as exc:
+        complete([{"role": "user", "content": "x"}], config)
+
+    assert "--setup" in str(exc.value)
+
+
+def test_missing_model_is_an_llm_error(config, monkeypatch):
+    """cli's summarize path catches LLMError; an uncaught raise there would
+    traceback *after* the changelog already printed."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    config.model = ""
+
+    with pytest.raises(LLMError):
+        complete([{"role": "user", "content": "x"}], config)
+
+
+# ---------------------------------------------------------------------------
+# Retired / unknown model
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_retired_model_raises_model_unavailable(config, monkeypatch, status):
+    """HTTP 410 is exactly what NVIDIA returned for the retired default."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = status
+    resp.text = "model has reached its end of life"
+
+    with patch("voicelog.llm.httpx.post", return_value=resp):
+        with pytest.raises(ModelUnavailable):
+            complete([{"role": "user", "content": "x"}], config)
+
+
+def test_retired_model_does_not_consume_the_retry(config, monkeypatch):
+    """Retrying a dead model id only doubles the wait before the same answer."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 410
+    resp.text = "gone"
+
+    with patch("voicelog.llm.httpx.post", return_value=resp) as post:
+        with pytest.raises(ModelUnavailable):
+            complete([{"role": "user", "content": "x"}], config)
+
+    assert post.call_count == 1
+
+
+def test_model_unavailable_message_names_model_and_setup(config, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    config.model = "vendor/retired-model"
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 410
+    resp.text = "gone"
+
+    with patch("voicelog.llm.httpx.post", return_value=resp):
+        with pytest.raises(ModelUnavailable) as exc:
+            complete([{"role": "user", "content": "x"}], config)
+
+    message = str(exc.value)
+    assert "vendor/retired-model" in message
+    assert "--setup" in message
+    assert config.base_url in message  # a 404 can equally mean a wrong base_url
+
+
+def test_model_unavailable_is_an_llm_error(config, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 404
+    resp.text = "nope"
+
+    with patch("voicelog.llm.httpx.post", return_value=resp):
+        with pytest.raises(LLMError):
+            complete([{"role": "user", "content": "x"}], config)
+
+
+def test_server_error_still_retries_and_stays_a_plain_llm_error(config, monkeypatch):
+    """Real outages keep the documented retry-then-soft-fallback behaviour."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 500
+    resp.text = "boom"
+
+    with patch("voicelog.llm.httpx.post", return_value=resp) as post:
+        with pytest.raises(LLMError) as exc:
+            complete([{"role": "user", "content": "x"}], config)
+
+    assert post.call_count == 2
+    assert not isinstance(exc.value, ModelUnavailable)
+
+
+# ---------------------------------------------------------------------------
+# base_url handling
+# ---------------------------------------------------------------------------
+
+def test_trailing_slash_base_url_does_not_double_the_separator(config, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    config.base_url = "https://example.test/v1/"
+    resp = MagicMock()
+    resp.is_success = True
+    resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+
+    with patch("voicelog.llm.httpx.post", return_value=resp) as post:
+        complete([{"role": "user", "content": "x"}], config)
+
+    assert post.call_args[0][0] == "https://example.test/v1/chat/completions"
+
+
+# ---------------------------------------------------------------------------
+# Keyless endpoints (a local Ollama)
+# ---------------------------------------------------------------------------
+
+def test_blank_api_key_env_means_no_key_is_needed(config, monkeypatch):
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    config.api_key_env = ""
+    resp = MagicMock()
+    resp.is_success = True
+    resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+
+    with patch("voicelog.llm.httpx.post", return_value=resp) as post:
+        assert complete([{"role": "user", "content": "x"}], config) == "ok"
+
+    assert "Authorization" not in post.call_args[1]["headers"]
+
+
+# ---------------------------------------------------------------------------
+# Secret hygiene
+# ---------------------------------------------------------------------------
+
+def test_error_text_does_not_echo_the_api_key(config, monkeypatch):
+    """Some gateways quote the offending request - including its key - in a 401."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-supersecret")
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 401
+    resp.text = 'unauthorized: header was "Bearer nvapi-supersecret"'
+
+    with patch("voicelog.llm.httpx.post", return_value=resp):
+        with pytest.raises(LLMError) as exc:
+            complete([{"role": "user", "content": "x"}], config)
+
+    assert "nvapi-supersecret" not in str(exc.value)
+
+
+def test_a_key_straddling_the_truncation_point_is_still_redacted(config, monkeypatch):
+    """Truncating before redacting cuts the key in half, and then no replace()
+    can find it - the prefix ships to stderr and into CI logs."""
+    key = "nvapi-0123456789abcdefghijklmnop"
+    monkeypatch.setenv("NVIDIA_API_KEY", key)
+    # Place the key so that it spans the 300-char cut.
+    body = ("x" * 290) + key + ("y" * 50)
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 401
+    resp.text = body
+
+    with patch("voicelog.llm.httpx.post", return_value=resp):
+        with pytest.raises(LLMError) as exc:
+            complete([{"role": "user", "content": "x"}], config)
+
+    message = str(exc.value)
+    assert key not in message
+    assert "nvapi-0123456789" not in message  # not even the prefix
+
+
+# ---------------------------------------------------------------------------
+# A rejected key is a configuration problem, not an outage
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_rejected_key_raises_invalid_api_key(config, monkeypatch, status):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-expired")
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = status
+    resp.text = "unauthorized"
+
+    with patch("voicelog.llm.httpx.post", return_value=resp):
+        with pytest.raises(InvalidApiKey):
+            complete([{"role": "user", "content": "x"}], config)
+
+
+def test_rejected_key_does_not_consume_the_retry(config, monkeypatch):
+    """A wrong key will not become right on a second attempt."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-expired")
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 401
+    resp.text = "unauthorized"
+
+    with patch("voicelog.llm.httpx.post", return_value=resp) as post:
+        with pytest.raises(InvalidApiKey):
+            complete([{"role": "user", "content": "x"}], config)
+
+    assert post.call_count == 1
+
+
+def test_rejected_key_message_names_the_env_var_and_expiry(config, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-expired")
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 401
+    resp.text = "unauthorized"
+
+    with patch("voicelog.llm.httpx.post", return_value=resp):
+        with pytest.raises(InvalidApiKey) as exc:
+            complete([{"role": "user", "content": "x"}], config)
+
+    message = str(exc.value)
+    assert "NVIDIA_API_KEY" in message
+    assert "expire" in message.lower()
+
+
+def test_invalid_api_key_is_an_llm_error(config, monkeypatch):
+    """So the spoken-summary path, which runs after the changelog has printed,
+    keeps catching it instead of tracebacking."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-expired")
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 401
+    resp.text = "unauthorized"
+
+    with patch("voicelog.llm.httpx.post", return_value=resp):
+        with pytest.raises(LLMError):
+            complete([{"role": "user", "content": "x"}], config)
+
+
+def test_rejected_key_error_does_not_echo_the_key(config, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-supersecret")
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 401
+    resp.text = 'unauthorized: "Bearer nvapi-supersecret"'
+
+    with patch("voicelog.llm.httpx.post", return_value=resp):
+        with pytest.raises(InvalidApiKey) as exc:
+            complete([{"role": "user", "content": "x"}], config)
+
+    assert "nvapi-supersecret" not in str(exc.value)
+
+
+def test_auth_statuses_are_shared_with_providers():
+    from voicelog import llm, providers
+
+    assert providers.AUTH_REJECTED == (401, 403)
+    assert llm._AUTH_REJECTED is providers.AUTH_REJECTED
+
+
+# ---------------------------------------------------------------------------
+# Parameter negotiation - reasoning models reject our defaults
+# ---------------------------------------------------------------------------
+
+def _unsupported(param, message=None):
+    """A provider 400 for an unsupported parameter, OpenAI's shape."""
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 400
+    resp.json.return_value = {
+        "error": {
+            "message": message or f"Unsupported parameter: '{param}' is not supported with this model.",
+            "param": param,
+            "code": "unsupported_parameter",
+        }
+    }
+    resp.text = "400"
+    return resp
+
+
+def _ok(content="generated text"):
+    resp = MagicMock()
+    resp.is_success = True
+    resp.status_code = 200
+    resp.json.return_value = {"choices": [{"message": {"content": content}}]}
+    return resp
+
+
+def test_max_tokens_is_renamed_when_the_model_rejects_it(config, monkeypatch):
+    """o-series and gpt-5 want max_completion_tokens. Hardcoding a model list
+    would be the same rot we removed for model ids, so ask the provider."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    responses = [_unsupported("max_tokens"), _ok()]
+
+    with patch("voicelog.llm.httpx.post", side_effect=responses) as post:
+        assert complete([{"role": "user", "content": "x"}], config) == "generated text"
+
+    body = post.call_args[1]["json"]
+    assert "max_tokens" not in body
+    assert body["max_completion_tokens"] == 4096
+
+
+def test_temperature_is_dropped_when_the_model_rejects_it(config, monkeypatch):
+    """o-series only supports the default temperature."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    responses = [_unsupported("temperature"), _ok()]
+
+    with patch("voicelog.llm.httpx.post", side_effect=responses) as post:
+        complete([{"role": "user", "content": "x"}], config)
+
+    assert "temperature" not in post.call_args[1]["json"]
+
+
+def test_both_parameters_can_be_negotiated_in_one_run(config, monkeypatch):
+    """A reasoning model rejects both, one at a time."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    responses = [_unsupported("max_tokens"), _unsupported("temperature"), _ok()]
+
+    with patch("voicelog.llm.httpx.post", side_effect=responses) as post:
+        assert complete([{"role": "user", "content": "x"}], config) == "generated text"
+
+    body = post.call_args[1]["json"]
+    assert "max_tokens" not in body
+    assert "temperature" not in body
+    assert body["max_completion_tokens"] == 4096
+    assert post.call_count == 3
+
+
+def test_negotiation_reads_the_message_when_there_is_no_param_field(config, monkeypatch):
+    """Not every provider fills in error.param."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    bare = MagicMock()
+    bare.is_success = False
+    bare.status_code = 400
+    bare.json.return_value = {
+        "error": {"message": "Unsupported parameter: 'max_tokens' is not supported"}
+    }
+    bare.text = "400"
+
+    with patch("voicelog.llm.httpx.post", side_effect=[bare, _ok()]) as post:
+        complete([{"role": "user", "content": "x"}], config)
+
+    assert "max_completion_tokens" in post.call_args[1]["json"]
+
+
+def test_an_unrelated_400_is_not_negotiated(config, monkeypatch):
+    """Only parameters we actually sent, and only ones we know how to change."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 400
+    resp.json.return_value = {"error": {"message": "your prompt is too long"}}
+    resp.text = "too long"
+
+    with patch("voicelog.llm.httpx.post", return_value=resp) as post:
+        with pytest.raises(LLMError):
+            complete([{"role": "user", "content": "x"}], config)
+
+    assert post.call_count == 2      # the normal retry, no adaptation loop
+
+
+def test_negotiation_is_bounded(config, monkeypatch):
+    """A provider that always says 400 must not loop forever."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+
+    with patch("voicelog.llm.httpx.post", return_value=_unsupported("max_tokens")) as post:
+        with pytest.raises(LLMError):
+            complete([{"role": "user", "content": "x"}], config)
+
+    assert post.call_count <= 6
+
+
+def test_a_server_error_still_retries_exactly_twice(config, monkeypatch):
+    """Negotiation must not disturb the ordinary retry budget."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    resp = MagicMock()
+    resp.is_success = False
+    resp.status_code = 500
+    resp.text = "boom"
+
+    with patch("voicelog.llm.httpx.post", return_value=resp) as post:
+        with pytest.raises(LLMError):
+            complete([{"role": "user", "content": "x"}], config)
+
+    assert post.call_count == 2
+
+
+def test_the_verifier_negotiates_too(config, monkeypatch):
+    """Otherwise the check would condemn a model generation can now drive."""
+    from voicelog import providers
+
+    with patch("voicelog.providers.httpx.post",
+               side_effect=[_unsupported("max_tokens"), _ok()]):
+        assert providers.verify_model("https://x/v1", "k", "openai/o4-mini") is None

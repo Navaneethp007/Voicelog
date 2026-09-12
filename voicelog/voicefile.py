@@ -16,8 +16,16 @@ UNRELEASED_RE = re.compile(r"^## Unreleased\b")
 BLOCK_BOUNDARY_RE = re.compile(r"^## ", re.MULTILINE)
 
 
-def _voice_path(repo_dir: str) -> str:
-    return os.path.join(repo_dir, ".changelog", "voice.md")
+DEFAULT_VOICE_MD = os.path.join(".changelog", "voice.md")
+
+
+def _voice_path(repo_dir: str, rel_path: str | None = None) -> str:
+    """Where the persistent changelog lives, honouring the configured path.
+
+    os.path.join lets an absolute ``rel_path`` win outright, which is intended:
+    someone who configures an absolute path means it.
+    """
+    return os.path.join(repo_dir, rel_path or DEFAULT_VOICE_MD)
 
 
 def _marker_line(tag: str | None) -> str:
@@ -72,13 +80,19 @@ def _normalize_block(md: str) -> str:
     return md.rstrip("\n") + "\n"
 
 
-def update_voice_md(repo_dir: str, new_unreleased_md: str, current_tag: str | None) -> bool:
+def update_voice_md(
+    repo_dir: str,
+    new_unreleased_md: str,
+    current_tag: str | None,
+    *,
+    rel_path: str | None = None,
+) -> bool:
     """Update the persistent voice changelog.
 
     Returns True if the file content changed on disk, False if it was already
     identical.
     """
-    path = _voice_path(repo_dir)
+    path = _voice_path(repo_dir, rel_path)
     marker = _marker_line(current_tag)
     fresh = _normalize_block(new_unreleased_md)
 

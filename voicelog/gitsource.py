@@ -127,6 +127,36 @@ def read_recent_commits(n: int = 15, with_diff: bool = False) -> GitResult:
     return GitResult(commits=commits, used_fallback=False, tag=None, diff=diff)
 
 
+def head_sha() -> str | None:
+    """Full sha of HEAD, or None in an empty repo or outside one.
+
+    Used for the watermark rather than ``GitResult.commits[0].hash``: git log
+    orders by commit date, so with clock skew or a rebase the newest record is
+    not necessarily HEAD - and after noise filtering it definitely is not.
+    """
+    result = _run("git", "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def is_ancestor(candidate: str, descendant: str = "HEAD") -> bool:
+    """Whether ``candidate`` is reachable from ``descendant``.
+
+    Guards a stored watermark. After a rebase, a hard reset, a gc or a shallow
+    clone the sha may not resolve at all; after a branch switch it can resolve
+    while ``<sha>..HEAD`` means nothing useful. git exits 1 for "no" and 128 for
+    "no such commit", so both collapse to False - which is what keeps a stale
+    watermark from reaching read_commits and ending the run with "unknown git
+    ref".
+    """
+    if not candidate:
+        return False
+    return _run(
+        "git", "merge-base", "--is-ancestor", candidate, descendant
+    ).returncode == 0
+
+
 def detect_base_branch() -> str | None:
     """Best-effort guess of the branch a PR would target.
 

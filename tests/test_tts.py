@@ -390,3 +390,81 @@ def test_elevenlabs_missing_voice_id_raises(monkeypatch):
     with pytest.raises(TTSError) as exc:
         tts.speak("Hello there.", NoVoiceConfig())
     assert "tts_voice" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Keys must not travel in error text
+# ---------------------------------------------------------------------------
+
+def test_openai_error_does_not_echo_the_key(monkeypatch):
+    """tts_base_url is user-settable, so this adapter can be pointed at a
+    proxy that quotes the request - headers included - back at us."""
+    key = "sk-0123456789abcdefghij"
+    monkeypatch.setenv("OPENAI_API_KEY", key)
+    monkeypatch.setattr(tts, "_play", lambda path: None)
+
+    mock_resp = mock.MagicMock()
+    mock_resp.is_success = False
+    mock_resp.status_code = 401
+    mock_resp.text = f'unauthorized: sent "Bearer {key}"'
+
+    with mock.patch("voicelog.tts.httpx.post", return_value=mock_resp):
+        with pytest.raises(TTSError) as exc:
+            tts.speak("Hello there.", OpenAIConfig())
+
+    assert key not in str(exc.value)
+    assert "401" in str(exc.value)  # still says what happened
+
+
+def test_openai_error_redacts_before_truncating(monkeypatch):
+    """The body is cut to 200 chars; cutting first would strand a key prefix."""
+    key = "sk-0123456789abcdefghij"
+    monkeypatch.setenv("OPENAI_API_KEY", key)
+    monkeypatch.setattr(tts, "_play", lambda path: None)
+
+    mock_resp = mock.MagicMock()
+    mock_resp.is_success = False
+    mock_resp.status_code = 401
+    mock_resp.text = ("x" * 190) + key + ("y" * 40)
+
+    with mock.patch("voicelog.tts.httpx.post", return_value=mock_resp):
+        with pytest.raises(TTSError) as exc:
+            tts.speak("Hello there.", OpenAIConfig())
+
+    # Only the first 10 characters of the key fall inside the 200-char cut, so
+    # that is the fragment a truncate-then-redact order would leak.
+    assert "sk-0123456" not in str(exc.value)
+
+
+def test_elevenlabs_error_does_not_echo_the_key(monkeypatch):
+    key = "el-0123456789abcdefghij"
+    monkeypatch.setenv("ELEVENLABS_API_KEY", key)
+    monkeypatch.setattr(tts, "_play", lambda path: None)
+
+    mock_resp = mock.MagicMock()
+    mock_resp.is_success = False
+    mock_resp.status_code = 401
+    mock_resp.text = f'unauthorized: xi-api-key was {key}'
+
+    with mock.patch("voicelog.tts.httpx.post", return_value=mock_resp):
+        with pytest.raises(TTSError) as exc:
+            tts.speak("Hello there.", ElevenLabsConfig())
+
+    assert key not in str(exc.value)
+    assert "401" in str(exc.value)
+
+
+def test_riva_error_does_not_echo_the_key(monkeypatch):
+    """The gRPC branch catches Exception broadly and wraps the whole auth
+    construction, which is handed the key."""
+    key = "nvapi-0123456789abcdefghij"
+    monkeypatch.setenv("NVIDIA_API_KEY", key)
+    fake_riva, fake_encoding, service = _make_fake_riva()
+    service.synthesize.side_effect = RuntimeError(f'bad metadata: Bearer {key}')
+    monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
+    monkeypatch.setattr(tts, "_play", lambda path: None)
+
+    with pytest.raises(TTSError) as exc:
+        tts.speak("Hello there.", FakeConfig())
+
+    assert key not in str(exc.value)

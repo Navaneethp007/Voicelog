@@ -13,7 +13,9 @@ venv/
 # Pytest
 .pytest_cache/
 
-# voicelog local cache (per-repo generation cache, not source)
+# voicelog keeps its cache and run watermark in .git/voicelog/, outside the
+# work tree, so nothing needs ignoring. This covers the pre-0.3 location,
+# for anyone whose clone still has the old file lying around.
 .changelog/.voicelog-cache.json
 
 # OS

@@ -66,9 +66,17 @@ def can_prompt() -> bool:
     `git commit` forever. Windows makes stdin-only worse still - the NUL device
     reports itself as a character device, so isatty() there is True.
 
-    Every prompt in voicelog goes through this, the key prompt included.
+    Every prompt in voicelog goes through this, the key prompt included -
+    which is why the streams are touched defensively. Under pythonw.exe
+    sys.stdin is None, and a detached or closed stream raises on isatty(); an
+    AttributeError there used to take down the entire command rather than the
+    one question it could not ask. textstyle.supports_style guards the same case
+    for the same reason.
     """
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+    try:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return False
+    except (AttributeError, ValueError):  # None, detached, closed, or exotic
         return False
     if any(os.environ.get(name) for name in _NON_INTERACTIVE_VARS):
         return False
@@ -147,39 +155,54 @@ def ask_choice(
     *,
     default: str | None = None,
     page: int = 20,
+    pinned: Sequence[tuple[str, str]] = (),
 ) -> str:
     """Numbered picker with substring filtering. Returns the chosen value.
 
     Type a number to pick, any other text to narrow the list (matched against
     both value and label), or Enter to take ``default``. At most ``page`` rows
-    are printed at a time, which is what keeps a 300-model catalog usable.
+    of ``options`` are printed at a time, which is what keeps a 300-model
+    catalog usable.
+
+    ``pinned`` rows always render, below the page and untouched by narrowing.
+    An escape hatch appended to ``options`` is not one: NVIDIA lists 82 models,
+    so "Type a model id manually" became option 83 - never printed and never
+    reachable - and it is wanted most when the catalog offers a model the
+    account turns out not to be able to call.
     """
     visible = list(options)
+    pinned = list(pinned)
     while True:
         shown = visible[:page]
+        rows = shown + pinned
+        # Numbering covers this page; Enter covers everything still on
+        # offer. A configured model sits beyond row 20 of an 82-model
+        # catalog, and returning it needs no row to point at.
+        selectable = visible + pinned
         print(f"\n{prompt}")
-        for index, (_, label) in enumerate(shown, start=1):
+        for index, (_, label) in enumerate(rows, start=1):
             print(f"  {index}) {label}")
         if len(visible) > len(shown):
+            # Counts the models, not our own pinned row.
             print(f"  ... {len(visible)} total; type text to narrow the list")
 
         default_label = ""
-        if default is not None and any(value == default for value, _ in visible):
+        if default is not None and any(value == default for value, _ in selectable):
             # "[nvidia]" reads like something to type; the input is a number.
             default_label = f" [Enter = {default}]"
-        answer = _read_line(f"Choose 1-{len(shown)}{default_label}: ").strip()
+        answer = _read_line(f"Choose 1-{len(rows)}{default_label}: ").strip()
 
         if not answer:
-            if default is not None and any(value == default for value, _ in visible):
+            if default is not None and any(value == default for value, _ in selectable):
                 return default
             print("  Please choose one.")
             continue
 
         if answer.isdigit():
             index = int(answer)
-            if 1 <= index <= len(shown):
-                return shown[index - 1][0]
-            print(f"  Pick a number between 1 and {len(shown)}.")
+            if 1 <= index <= len(rows):
+                return rows[index - 1][0]
+            print(f"  Pick a number between 1 and {len(rows)}.")
             continue
 
         needle = answer.lower()
@@ -346,17 +369,35 @@ def ensure_key(
         return bool(existing)
 
     who = f" for {label}" if label else ""
+    declined = False
     if existing:
         print(f"\n${env_name} is already set to {_mask(existing)}.")
         if ask_yes_no("Use that value?", default=True):
             return True
+        declined = True
     else:
         print(f"\nNo API key found in ${env_name}{who}.")
         if signup_url:
             print(f"  Get one at: {signup_url}")
 
-    key = ask_secret("Paste your API key (or press Enter to skip): ")
+    # "Skip" means "keep what is there", which is not on offer once the user
+    # has refused what is there - so the prompt has to say what Enter does.
+    key = ask_secret(
+        "Paste a different API key (or press Enter to continue without one): "
+        if declined
+        else "Paste your API key (or press Enter to skip): "
+    )
     if not key:
+        if declined:
+            # Refused, and nothing offered in its place. Returning True here
+            # meant the caller went on to authenticate discovery, model
+            # verification and generation with the very key the user had
+            # just rejected. Dropping it from this process only - never from
+            # the shell it came from - turns that into the ordinary,
+            # actionable missing-key error.
+            os.environ.pop(env_name, None)
+            print(f"  Not using the existing ${env_name} for this run.")
+            return False
         return bool(existing)
 
     os.environ[env_name] = key
@@ -372,10 +413,11 @@ def _pick_model(
     models: list[str], current: str, catalog_url: str
 ) -> str:
     """One pass of the model picker: choose from the catalog, or type an id."""
-    options = [(model, model) for model in models]
-    options.append((MANUAL_ENTRY, "Type a model id manually"))
     chosen = ask_choice(
-        "Which model?", options, default=current if current in models else None
+        "Which model?",
+        [(model, model) for model in models],
+        default=current if current in models else None,
+        pinned=[(MANUAL_ENTRY, "Type a model id manually")],
     )
     if chosen == MANUAL_ENTRY:
         if catalog_url:
@@ -488,10 +530,20 @@ def _choose_llm(current: dict[str, Any]) -> dict[str, Any]:
     )
     api_key = os.environ.get(api_key_env) if api_key_env else None
 
+    # Offer the configured model only when it belongs to the provider being
+    # set up. Switching NVIDIA -> OpenAI used to hand OpenAI's picker
+    # "deepseek-ai/deepseek-coder-6.7b-instruct" as its default, so pressing
+    # Enter stored a guaranteed 404 - and it bites hardest on the path where
+    # discovery failed, which is the one place the user has no list to correct
+    # it from. Exactly the guard default_url above already applies.
+    current_model = (
+        current.get("model", "") if current.get("provider") == provider_key else ""
+    )
+
     model = choose_model(
         base_url,
         api_key,
-        current=current.get("model", ""),
+        current=current_model,
         catalog_url=preset.catalog_url,
     )
 
@@ -647,7 +699,6 @@ def _choose_tts(
 
     if preset.voices:
         voice_options = [(voice, voice) for voice in preset.voices]
-        voice_options.append((MANUAL_ENTRY, f"Type {preset.voice_hint}"))
         # Keep the configured voice only if it belongs to this service;
         # otherwise offer that service's first voice, so pressing Enter all the
         # way through setup never dead-ends on a prompt with no default.
@@ -655,7 +706,14 @@ def _choose_tts(
             voice_default = current["tts_voice"]
         else:
             voice_default = preset.voices[0]
-        voice = ask_choice("Which voice?", voice_options, default=voice_default)
+        # Pinned for the same reason as the model picker: no preset ships 20
+        # voices today, but an escape hatch that paging can hide is not one.
+        voice = ask_choice(
+            "Which voice?",
+            voice_options,
+            default=voice_default,
+            pinned=[(MANUAL_ENTRY, f"Type {preset.voice_hint}")],
+        )
         if voice == MANUAL_ENTRY:
             voice = ask_text("Voice")
     else:

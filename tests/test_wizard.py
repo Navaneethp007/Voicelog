@@ -6,6 +6,7 @@ conftest's guard would fail the test if it were not.
 """
 from __future__ import annotations
 
+import io
 import os
 from unittest import mock
 
@@ -1128,3 +1129,230 @@ def test_restating_the_same_voice_backend_keeps_its_settings(monkeypatch, tmp_pa
     assert values["tts_provider"] == "openai"
     assert "tts_model" not in values      # untouched, so the stored value survives
     assert "tts_base_url" not in values
+
+
+# ---------------------------------------------------------------------------
+# can_prompt must survive a process with no usable streams
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("stream", [None, "closed"])
+@pytest.mark.parametrize("name", ["stdin", "stdout"])
+def test_can_prompt_is_false_when_a_stream_is_unusable(monkeypatch, name, stream):
+    """Under pythonw.exe sys.stdin is None, and a detached stream can be closed.
+    can_prompt is reached on EVERY invocation via _interactive and ensure_key,
+    so raising here took down the whole command, not just setup."""
+    if stream == "closed":
+        stream = io.StringIO()
+        stream.close()
+    _prompting_possible(monkeypatch)
+    monkeypatch.setattr(wizard.sys, name, stream)
+
+    assert wizard.can_prompt() is False
+
+
+def test_can_prompt_is_still_true_with_two_real_terminals(monkeypatch):
+    """The guard must not swallow the working case."""
+    _prompting_possible(monkeypatch)
+
+    assert wizard.can_prompt() is True
+
+
+# ---------------------------------------------------------------------------
+# A declined key must not be used
+# ---------------------------------------------------------------------------
+
+def test_a_declined_key_is_not_used_when_no_replacement_is_given(monkeypatch):
+    """Answering no to "Use that value?" and then pressing Enter used to return
+    True with the refused key still in os.environ - so the key the user had just
+    rejected was silently used for discovery, verification and generation."""
+    monkeypatch.setenv("MY_KEY", "sk-the-one-i-refused")
+    _prompting_possible(monkeypatch)
+    monkeypatch.setattr(wizard.getpass, "getpass", lambda prompt="": "")
+    _answers(monkeypatch, "n")
+
+    assert wizard.ensure_key("MY_KEY", confirm_existing=True) is False
+    assert "MY_KEY" not in os.environ
+
+
+def test_declining_says_what_enter_now_means(monkeypatch):
+    """Once the existing value is declined, Enter cannot mean "skip and keep
+    it" - there is nothing left to keep."""
+    monkeypatch.setenv("MY_KEY", "old-value")
+    _prompting_possible(monkeypatch)
+    prompts = []
+    monkeypatch.setattr(wizard.getpass, "getpass",
+                        lambda prompt="": prompts.append(prompt) or "")
+    _answers(monkeypatch, "n")
+
+    wizard.ensure_key("MY_KEY", confirm_existing=True)
+
+    assert "skip" not in prompts[0].lower()
+    assert "without" in prompts[0].lower()
+
+
+def test_a_confirmed_key_is_left_alone(monkeypatch):
+    """The decline path must not disturb the ordinary yes."""
+    monkeypatch.setenv("MY_KEY", "keep-me")
+    _prompting_possible(monkeypatch)
+    _answers(monkeypatch, "y")
+
+    assert wizard.ensure_key("MY_KEY", confirm_existing=True) is True
+    assert os.environ["MY_KEY"] == "keep-me"
+
+
+# ---------------------------------------------------------------------------
+# A long catalog must not push the escape hatch off the page
+# ---------------------------------------------------------------------------
+
+# What integrate.api.nvidia.com actually returns from /v1/models, against a
+# 20-row page: "Type a model id manually" was option 83.
+_NVIDIA_CATALOG_SIZE = 82
+
+
+def test_manual_entry_survives_a_catalog_longer_than_one_page(monkeypatch):
+    """The manual row was appended to the options, so paging cut it off - the
+    one option a user needs when the catalog lists a model their account cannot
+    call, which is exactly the situation that sends them looking for it."""
+    models = [f"m/{i}" for i in range(_NVIDIA_CATALOG_SIZE)]
+    _answers(monkeypatch, "21", "typed/model")   # 21 = the row after the page
+
+    with mock.patch.object(providers, "fetch_models", return_value=models):
+        assert wizard.choose_model("https://x/v1", "k") == "typed/model"
+
+
+def test_the_manual_row_is_printed_and_numbered(monkeypatch, capsys):
+    models = [f"m/{i}" for i in range(_NVIDIA_CATALOG_SIZE)]
+    prompts = []
+
+    def _input(prompt=""):
+        prompts.append(prompt)
+        return ["21", "typed/model"][len(prompts) - 1]
+
+    monkeypatch.setattr("builtins.input", _input)
+    with mock.patch.object(providers, "fetch_models", return_value=models):
+        wizard.choose_model("https://x/v1", "k")
+
+    assert "Type a model id manually" in capsys.readouterr().out
+    # The prompt goes to input(), not stdout: 20 paged rows plus the pinned one.
+    assert "Choose 1-21" in prompts[0]
+
+
+def test_the_total_counts_models_not_the_manual_row(monkeypatch, capsys):
+    """It used to say "21 total" for 20 models, counting its own escape hatch."""
+    models = [f"m/{i}" for i in range(_NVIDIA_CATALOG_SIZE)]
+    _answers(monkeypatch, "1")
+
+    with mock.patch.object(providers, "fetch_models", return_value=models):
+        wizard.choose_model("https://x/v1", "k")
+
+    assert f"{_NVIDIA_CATALOG_SIZE} total" in capsys.readouterr().out
+
+
+def test_narrowing_keeps_the_manual_row_reachable(monkeypatch):
+    """Filtering replaces the visible list, which must not drop the pinned row."""
+    models = [f"m/{i}" for i in range(_NVIDIA_CATALOG_SIZE)] + ["zeta/one"]
+    _answers(monkeypatch, "zeta", "2", "typed/model")  # narrow, pick manual, type
+
+    with mock.patch.object(providers, "fetch_models", return_value=models):
+        assert wizard.choose_model("https://x/v1", "k") == "typed/model"
+
+
+def test_a_short_catalog_still_numbers_manual_entry_last(monkeypatch):
+    """The fix must not renumber the ordinary case."""
+    _answers(monkeypatch, "3", "typed/model")
+
+    with mock.patch.object(providers, "fetch_models", return_value=["a/one", "b/two"]):
+        assert wizard.choose_model("https://x/v1", "k") == "typed/model"
+
+
+# ---------------------------------------------------------------------------
+# A model id belongs to the provider it came from
+# ---------------------------------------------------------------------------
+
+def _llm_answers(monkeypatch, provider_choice):
+    _prompting_possible(monkeypatch)
+    monkeypatch.setattr(wizard.getpass, "getpass", lambda prompt="": "sk-pasted")
+    _answers(monkeypatch, provider_choice, "", "")  # provider, base_url, env var
+
+
+def test_the_model_default_does_not_cross_a_provider_switch(monkeypatch):
+    """Switching NVIDIA -> OpenAI offered 'deepseek-ai/deepseek-coder-6.7b-instruct'
+    as the model-id default, so pressing Enter stored a guaranteed 404. The
+    base_url default next to it has always been guarded this way."""
+    seen = {}
+    monkeypatch.setattr(wizard, "choose_model",
+                        lambda base_url, api_key, **kw: seen.update(kw) or "gpt-4o-mini")
+    _llm_answers(monkeypatch, "2")   # openai
+
+    wizard._choose_llm(_current_with(
+        provider="nvidia", model="deepseek-ai/deepseek-coder-6.7b-instruct"))
+
+    assert seen["current"] == ""
+
+
+def test_the_model_default_survives_restating_the_same_provider(monkeypatch):
+    """Re-running setup without changing provider must still offer the model
+    you already use - otherwise every run retypes it."""
+    seen = {}
+    monkeypatch.setattr(wizard, "choose_model",
+                        lambda base_url, api_key, **kw: seen.update(kw) or "kept/model")
+    _llm_answers(monkeypatch, "1")   # nvidia, same as current
+
+    wizard._choose_llm(_current_with(provider="nvidia", model="keep/this"))
+
+    assert seen["current"] == "keep/this"
+
+
+def _scripted(monkeypatch, *replies, limit=4):
+    """input() that fails loudly instead of looping forever on a bad default."""
+    prompts = []
+
+    def _input(prompt=""):
+        prompts.append(prompt)
+        if len(prompts) > limit:
+            raise AssertionError(f"prompt repeated {len(prompts)}x: {prompt!r}")
+        return replies[len(prompts) - 1] if len(prompts) <= len(replies) else ""
+
+    monkeypatch.setattr("builtins.input", _input)
+    return prompts
+
+
+def test_a_default_beyond_the_first_page_is_still_offered(monkeypatch):
+    """Re-running --setup against NVIDIA's 82 models: the configured model is
+    usually not in the first 20 rows, and keeping it with Enter is the common
+    path. Checking membership against the printed page instead of the whole
+    list hid the hint and rejected Enter with "Please choose one."."""
+    options = [(f"m/{i}", f"m/{i}") for i in range(_NVIDIA_CATALOG_SIZE)]
+    prompts = _scripted(monkeypatch, "")
+
+    chosen = wizard.ask_choice(
+        "Which model?", options, default="m/50",
+        pinned=[(wizard.MANUAL_ENTRY, "Type a model id manually")],
+    )
+
+    assert chosen == "m/50"
+    assert "Enter = m/50" in prompts[0]
+
+
+def test_a_pinned_value_can_still_be_the_default(monkeypatch):
+    options = [(f"m/{i}", f"m/{i}") for i in range(_NVIDIA_CATALOG_SIZE)]
+    prompts = _scripted(monkeypatch, "")
+
+    chosen = wizard.ask_choice(
+        "Which model?", options, default=wizard.MANUAL_ENTRY,
+        pinned=[(wizard.MANUAL_ENTRY, "Type a model id manually")],
+    )
+
+    assert chosen == wizard.MANUAL_ENTRY
+    assert f"Enter = {wizard.MANUAL_ENTRY}" in prompts[0]
+
+
+def test_a_default_that_is_not_on_offer_is_not_advertised(monkeypatch):
+    """The guard that stops a stale config value being accepted silently."""
+    options = [(f"m/{i}", f"m/{i}") for i in range(_NVIDIA_CATALOG_SIZE)]
+    prompts = _scripted(monkeypatch, "", "1")
+
+    chosen = wizard.ask_choice("Which model?", options, default="gone/model")
+
+    assert chosen == "m/0"                      # Enter refused, then picked 1
+    assert "Enter =" not in prompts[0]

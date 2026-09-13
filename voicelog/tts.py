@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import wave
 
 import httpx
@@ -53,13 +54,78 @@ def _check_playback() -> None:
             )
 
 
+# How long to wait between checks while asynchronous playback runs. Short
+# enough that Ctrl+C feels immediate, long enough not to spin the CPU.
+_PLAY_POLL_SECONDS = 0.1
+
+# Audio may still be draining when the computed duration elapses; this much
+# grace keeps the last syllable from being cut by the temp file's deletion.
+_PLAY_GRACE_SECONDS = 0.25
+
+
+def _import_winsound():
+    """Import winsound. Kept thin so tests can substitute a fake player."""
+    import winsound
+
+    return winsound
+
+
+def _wav_seconds(path: str) -> float:
+    """How long a WAV runs for, or 0.0 when that cannot be determined."""
+    try:
+        with wave.open(path, "rb") as wav:
+            rate = wav.getframerate()
+            return wav.getnframes() / rate if rate else 0.0
+    except (OSError, wave.Error, EOFError):
+        # EOFError is what a truncated file raises, and it is not an OSError.
+        return 0.0
+
+
+def _play_windows(path: str) -> None:
+    """Play a WAV on Windows, interruptibly.
+
+    PlaySound is a blocking call into the OS, and Python can only deliver
+    KeyboardInterrupt between bytecode instructions - so a synchronous play
+    queued the user's Ctrl+C until the audio had finished on its own, and the
+    handler then reported "skipped audio" for something fully played. The CLI
+    prints "Ctrl+C to skip" before every utterance, so that was a promise the
+    code did not keep.
+
+    Playing asynchronously and waiting in slices puts the interrupt back within
+    reach; SND_PURGE stops sound that is already playing, which is what makes it
+    a skip rather than a delayed acknowledgement. POSIX needs none of this: Ctrl+C
+    reaches the whole process group, so afplay/aplay are signalled directly.
+    """
+    winsound = _import_winsound()
+    seconds = _wav_seconds(path)
+    if not seconds:
+        # No duration to wait out. A plain synchronous play is still better than
+        # not playing at all - it just cannot be interrupted.
+        winsound.PlaySound(path, winsound.SND_FILENAME)
+        return
+
+    deadline = time.monotonic() + seconds + _PLAY_GRACE_SECONDS
+    try:
+        # Inside the try: an interrupt arriving between starting the sound
+        # and reaching the loop would otherwise escape the purge, leaving
+        # audio playing under a 'skipped audio' message and a temp WAV that
+        # speak() cannot delete while it is still open.
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(_PLAY_POLL_SECONDS, remaining))
+    except KeyboardInterrupt:
+        winsound.PlaySound(None, winsound.SND_PURGE)
+        raise
+
+
 def _play(path: str) -> None:
     """Play a WAV file synchronously on the current OS. Patchable in tests."""
     system = platform.system()
     if system == "Windows":
-        import winsound
-
-        winsound.PlaySound(path, winsound.SND_FILENAME)
+        _play_windows(path)
         return
     if system == "Darwin":
         subprocess.run(["afplay", path], check=True)

@@ -468,3 +468,109 @@ def test_riva_error_does_not_echo_the_key(monkeypatch):
         tts.speak("Hello there.", FakeConfig())
 
     assert key not in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Windows playback must be interruptible
+# ---------------------------------------------------------------------------
+
+class _FakeWinsound:
+    """Stands in for the winsound module, recording how it was called."""
+    SND_FILENAME = 0x20000
+    SND_ASYNC = 0x0001
+    SND_PURGE = 0x0040
+
+    def __init__(self):
+        self.calls = []
+
+    def PlaySound(self, sound, flags):
+        self.calls.append((sound, flags))
+
+
+def _wav(tmp_path, seconds=2.0, rate=8000):
+    import wave
+    path = tmp_path / "a.wav"
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(2 * int(rate * seconds)))  # silence
+    return str(path)
+
+
+def test_wav_seconds_reads_the_real_length(tmp_path):
+    assert tts._wav_seconds(_wav(tmp_path, seconds=1.5)) == pytest.approx(1.5, abs=0.01)
+
+
+def test_wav_seconds_is_zero_for_an_unreadable_file(tmp_path):
+    bad = tmp_path / "not.wav"
+    bad.write_bytes(b"definitely not a wav")
+
+    assert tts._wav_seconds(str(bad)) == 0.0
+
+
+def test_windows_playback_is_asynchronous(monkeypatch, tmp_path):
+    """Synchronous PlaySound is a blocking C call, so Python cannot deliver
+    KeyboardInterrupt until it returns - Ctrl+C sat queued until the audio
+    ended on its own, while the CLI was printing "Ctrl+C to skip"."""
+    fake = _FakeWinsound()
+    monkeypatch.setattr(tts, "_import_winsound", lambda: fake)
+    monkeypatch.setattr(tts.time, "sleep", lambda s: None)
+
+    tts._play_windows(_wav(tmp_path, seconds=1.0))
+
+    sound, flags = fake.calls[0]
+    assert flags & fake.SND_ASYNC
+    assert not any(f & fake.SND_PURGE for _, f in fake.calls)
+
+
+def test_ctrl_c_during_playback_stops_the_audio(monkeypatch, tmp_path):
+    fake = _FakeWinsound()
+    monkeypatch.setattr(tts, "_import_winsound", lambda: fake)
+
+    def _interrupt(seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(tts.time, "sleep", _interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        tts._play_windows(_wav(tmp_path, seconds=30.0))
+
+    # Purged, so the sound stops now rather than playing out its 30 seconds.
+    assert fake.calls[-1] == (None, fake.SND_PURGE)
+
+
+def test_an_unreadable_wav_still_plays(monkeypatch, tmp_path):
+    """With no duration there is nothing to wait for, so fall back to a plain
+    synchronous play rather than not playing at all."""
+    fake = _FakeWinsound()
+    monkeypatch.setattr(tts, "_import_winsound", lambda: fake)
+    bad = tmp_path / "not.wav"
+    bad.write_bytes(b"nope")
+
+    tts._play_windows(str(bad))
+
+    assert fake.calls == [(str(bad), fake.SND_FILENAME)]
+
+
+def test_an_interrupt_as_playback_starts_still_purges(monkeypatch, tmp_path):
+    """The window between starting async playback and entering the wait loop.
+    An interrupt landing there escaped the handler, so the CLI reported
+    "skipped audio" while the sound played on - the very symptom the async
+    change was made to fix - and left speak()'s os.remove failing silently on
+    a WAV still open for playback, leaking the temp file."""
+    fake = _FakeWinsound()
+    real_play = fake.PlaySound
+
+    def _play(sound, flags):
+        real_play(sound, flags)
+        if flags & fake.SND_ASYNC:
+            raise KeyboardInterrupt      # the signal arrives as playback starts
+
+    fake.PlaySound = _play
+    monkeypatch.setattr(tts, "_import_winsound", lambda: fake)
+
+    with pytest.raises(KeyboardInterrupt):
+        tts._play_windows(_wav(tmp_path, seconds=30.0))
+
+    assert fake.calls[-1] == (None, fake.SND_PURGE)

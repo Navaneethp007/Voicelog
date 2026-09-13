@@ -804,6 +804,8 @@ def main() -> None:
         base_url=cfg.base_url,
     )
     raw_markdown = None if args.fresh else cache.get(cwd, key)
+    # A cache hit needs no write, so there is nothing that can fail.
+    cached_ok = True
 
     if raw_markdown is None:
         diff = _diff_for(git_result, commits, args.with_diff)
@@ -820,7 +822,7 @@ def main() -> None:
             print(f"warning: LLM unavailable ({exc}) — falling back to commit list", file=sys.stderr)
             _emit(render.render_fallback(commits))
             sys.exit(0)
-        cache.put(cwd, key, raw_markdown)
+        cached_ok = cache.put(cwd, key, raw_markdown)
 
     # --- Render and output (text first, always — never gated on TTS) ---
     rendered = render.render(raw_markdown)
@@ -844,7 +846,17 @@ def main() -> None:
     # Placed before the speech block because generate.summarize does not catch
     # KeyboardInterrupt, and a Ctrl+C there would skip a write placed lower -
     # leaving the user to re-read the identical range next time.
-    if watermark_mode and persisted_ok:
+    # cached_ok joins the gate for the same reason persisted_ok is in it: if
+    # nothing kept this generation, advancing hides it from both directions -
+    # --replay finds no cache and --since-last sees no new commits - leaving a
+    # paid summary in terminal scrollback and nowhere else. Re-generating it
+    # next run costs another call; losing it costs the call AND the text.
+    #
+    # This does not risk a permanently frozen watermark: record_summarised
+    # writes into the same .git/voicelog directory, so anything that makes that
+    # location unwritable already stops the watermark by itself. The gate only
+    # bites when the cache file alone is unwritable, which the next run can fix.
+    if watermark_mode and persisted_ok and cached_ok:
         head = gitsource.head_sha()
         if head:
             state.record_summarised(head)

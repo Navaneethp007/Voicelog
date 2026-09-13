@@ -2304,3 +2304,40 @@ def test_tts_provider_none_still_turns_speech_off(wired, monkeypatch):
     cli.main()
 
     assert seen["cfg"].speak is False
+
+
+# ---------------------------------------------------------------------------
+# The watermark must not advance past a generation nothing kept
+# ---------------------------------------------------------------------------
+
+def test_a_failed_cache_write_does_not_record(wired, monkeypatch, capsys):
+    """Advancing here loses the generation from both directions: --replay has
+    nothing cached and --since-last sees nothing new, so the only copy of a paid
+    summary is terminal scrollback. Re-generating next run is the lesser evil.
+
+    Reachable because state.record_summarised and the cache write can fail
+    independently: if the whole .git/voicelog directory is unwritable the
+    watermark write fails too, but a read-only cache.json alone leaves it fine.
+    """
+    recorded = _watermark(monkeypatch)
+    # Patch the underlying failure, not _write, so the real guard runs.
+    monkeypatch.setattr(cli.cache.os, "makedirs",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("read-only")))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
+
+    cli.main()
+
+    assert recorded == []
+    out = capsys.readouterr()
+    assert "## Unreleased" in out.out     # the text still printed
+    assert "cache" in out.err.lower()
+
+
+def test_a_successful_cache_write_still_records(wired, monkeypatch):
+    """The gate must not freeze the watermark on the ordinary path."""
+    recorded = _watermark(monkeypatch)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
+
+    cli.main()
+
+    assert recorded == ["a" * 40]

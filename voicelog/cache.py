@@ -20,8 +20,12 @@ from voicelog import state
 from voicelog.models import Commit
 
 
-# Kept for repos created by older versions, and as the fallback when there is
-# no git directory to write into.
+# The pre-0.3 location, kept ONLY as the fallback for when there is no git
+# directory to write into. It is deliberately not a migration source: inside
+# a repo state.private_path always succeeds, so this file is never read there,
+# and a pre-0.3 entry is keyed on commits that have since moved on - so it
+# would almost always miss anyway. An upgraded repo re-generates once and
+# leaves the old file as ignored cruft (see .gitignore).
 _LEGACY_RELPATH = os.path.join(".changelog", ".voicelog-cache.json")
 
 
@@ -35,7 +39,8 @@ def _cache_path(repo_dir: str) -> str:
     Outside one: the historical location under ``repo_dir``. That keeps this
     function total - every caller always has somewhere to write - and voicelog
     requires a git repo in practice, so it is a fallback rather than a path
-    anyone takes.
+    anyone takes. Note this means the legacy path is never *read* inside a repo,
+    so there is no migration from it; see the note on _LEGACY_RELPATH.
     """
     private = state.private_path("cache.json", repo_dir)
     return private if private else os.path.join(repo_dir, _LEGACY_RELPATH)

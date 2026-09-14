@@ -52,8 +52,13 @@ def test_load_path_with_partial_yaml_merges_over_defaults(tmp_path):
     assert cfg.provider == "openai"
     assert cfg.model == "gpt-4o"
 
-    # not in file → fall back to defaults
-    assert cfg.base_url == DEFAULTS["base_url"]
+    # A key the preset owns, absent from the file, comes from the preset the
+    # file selected - not from DEFAULTS. Falling back to DEFAULTS here is what
+    # sent the NVIDIA endpoint and key var to a run labelled "openai".
+    assert cfg.base_url == "https://api.openai.com/v1"
+    assert cfg.api_key_env == "OPENAI_API_KEY"
+
+    # not in file and owned by nobody → fall back to defaults
     assert cfg.sections == DEFAULTS["sections"]
     assert cfg.noise == DEFAULTS["noise"]
     assert cfg.voice_samples == DEFAULTS["voice_samples"]
@@ -746,3 +751,362 @@ def test_loading_still_expands_that_path(monkeypatch, tmp_path):
     _write_user_config("voice_samples: ~/notes/voice" + chr(10))
 
     assert "~" not in load(None).voice_samples
+
+
+# ---------------------------------------------------------------------------
+# A config file that is not UTF-8
+# ---------------------------------------------------------------------------
+
+def _write_bytes_user_config(raw: bytes):
+    """Write the user config as exact bytes, bypassing any encoding choice."""
+    path = config.user_config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(raw)
+    return path
+
+
+# A latin-1 e-acute: legal cp1252, invalid UTF-8.
+def _cp1252_config():
+    return ("model: caf" + chr(0xE9) + chr(10)).encode("cp1252")
+
+
+def test_a_non_utf8_config_is_reported_not_tracebacked(monkeypatch, tmp_path):
+    """PyYAML raises UnicodeDecodeError - a ValueError - from inside safe_load,
+    so it matched neither of _read_yaml's two handlers and escaped load(),
+    read_user_config() and save_user_config() as a raw traceback."""
+    monkeypatch.chdir(tmp_path)
+    _write_bytes_user_config(_cp1252_config())
+
+    with pytest.raises(config.ConfigFileInvalid) as exc:
+        load(None)
+
+    assert config.USER_CONFIG_NAME in str(exc.value)
+    # The base class, not ConfigFileUnreadable: "unreadable" promises an intact
+    # file behind a transient obstacle, which --setup must not overwrite. A
+    # mis-encoded file will never decode, and none of it is usable as text - so
+    # it has even less worth preserving than a parse error.
+    assert not isinstance(exc.value, config.ConfigFileUnreadable)
+
+
+def test_the_message_says_it_is_an_encoding_problem(monkeypatch, tmp_path):
+    """A bare "could not read" sends the user looking at file permissions."""
+    monkeypatch.chdir(tmp_path)
+    _write_bytes_user_config(_cp1252_config())
+
+    with pytest.raises(config.ConfigFileInvalid) as exc:
+        load(None)
+
+    assert "utf-8" in str(exc.value).lower()
+
+
+def test_setup_can_replace_a_non_utf8_config(monkeypatch, tmp_path):
+    """--setup exists to repair a broken config and could not repair this one,
+    because save_user_config re-reads through the very same function."""
+    monkeypatch.chdir(tmp_path)
+    _write_bytes_user_config(_cp1252_config())
+
+    config.save_user_config({"model": "new/model"})
+
+    assert config.read_user_config()["model"] == "new/model"
+    assert load(None).model == "new/model"
+
+
+def test_a_non_utf8_config_is_backed_up_not_destroyed(monkeypatch, tmp_path):
+    """The same courtesy a parse error already gets."""
+    monkeypatch.chdir(tmp_path)
+    path = _write_bytes_user_config(_cp1252_config())
+
+    config.save_user_config({"model": "new/model"})
+
+    backups = [n for n in os.listdir(os.path.dirname(path)) if ".bak" in n]
+    assert backups
+
+
+# ---------------------------------------------------------------------------
+# Numbers: quoted and float-shaped spellings, as bools already allow
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("written, key, expected", [
+    ('max_commits: "50"', "max_commits", 50),
+    ("max_commits: 50", "max_commits", 50),
+    ("tts_sample_rate: 44100.0", "tts_sample_rate", 44100),
+    ('fallback_commits: "25"', "fallback_commits", 25),
+    ('llm_timeout: "30"', "llm_timeout", 30.0),
+    ("llm_timeout: 30", "llm_timeout", 30.0),
+    ('tts_timeout: "12.5"', "tts_timeout", 12.5),
+])
+def test_a_coercible_number_is_accepted(monkeypatch, tmp_path, written, key, expected):
+    """0.1 and 0.2 did int(data["max_commits"]); the validation table replaced
+    that with a strict isinstance check, so upgrading made a quoted number
+    fatal. That _as_bool still accepts speak: "false" shows it was an
+    oversight rather than a tightening - YAML users quote things."""
+    cfg = _load_with_user_config(monkeypatch, tmp_path, written + chr(10))
+
+    assert getattr(cfg, key) == expected
+
+
+@pytest.mark.parametrize("written, key", [
+    ("max_commits: many", "max_commits"),          # not a number at all
+    ("max_commits: 0", "max_commits"),             # range, not type
+    ("max_commits: -1", "max_commits"),
+    ("max_commits: true", "max_commits"),          # bool is an int subclass
+    ('max_commits: "0"', "max_commits"),           # quoted, still out of range
+    ("max_commits: 1.5", "max_commits"),           # a real fraction of a commit
+    ('max_commits: "1.5"', "max_commits"),
+    ("tts_sample_rate: 44.1k", "tts_sample_rate"),
+    ("llm_timeout: soon", "llm_timeout"),
+    ("llm_timeout: 0", "llm_timeout"),
+    ('llm_timeout: "-5"', "llm_timeout"),
+])
+def test_an_uncoercible_or_out_of_range_number_still_names_itself(
+    monkeypatch, tmp_path, written, key
+):
+    """Relaxing the spelling must not relax the meaning."""
+    monkeypatch.chdir(tmp_path)
+    _write_user_config(written + chr(10))
+
+    with pytest.raises(config.ConfigValueInvalid) as exc:
+        load(None)
+
+    assert key in str(exc.value)
+
+
+def test_an_integral_float_is_not_silently_truncated(monkeypatch, tmp_path):
+    """44100.0 is the same integer; 44100.7 is a typo worth naming."""
+    monkeypatch.chdir(tmp_path)
+    _write_user_config("tts_sample_rate: 44100.7" + chr(10))
+
+    with pytest.raises(config.ConfigValueInvalid):
+        load(None)
+
+
+# ---------------------------------------------------------------------------
+# The file path validates and canonicalises what the flag path always did
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("written, key, suggestion", [
+    ("provider: openia", "provider", "nvidia"),
+    ("provider: nvidea", "provider", "openai"),
+    ("tts_provider: bananas", "tts_provider", "elevenlabs"),
+])
+def test_an_unknown_provider_in_a_file_names_itself(
+    monkeypatch, tmp_path, written, key, suggestion
+):
+    """--provider openia has always exited 2 naming the valid choices, while
+    the same typo in a config file sailed through as a plain string and only
+    surfaced as a confusing downstream failure."""
+    monkeypatch.chdir(tmp_path)
+    _write_user_config(written + chr(10))
+
+    with pytest.raises(config.ConfigValueInvalid) as exc:
+        load(None)
+
+    assert key in str(exc.value)
+    assert suggestion in str(exc.value)    # the message lists what would work
+
+
+def test_every_known_provider_is_accepted(monkeypatch, tmp_path):
+    from voicelog import providers
+    for key in providers.PROVIDERS:
+        cfg = _load_with_user_config(monkeypatch, tmp_path, f"provider: {key}" + chr(10))
+        assert cfg.provider == key
+
+
+def test_every_known_tts_provider_is_accepted(monkeypatch, tmp_path):
+    """Including `none`, which the wizard offers and --help documents."""
+    from voicelog import providers
+    for key in providers.TTS_PROVIDERS:
+        cfg = _load_with_user_config(monkeypatch, tmp_path,
+                                     f"tts_provider: {key}" + chr(10))
+        assert cfg.tts_provider == key
+
+
+def test_a_padded_provider_is_canonicalised(monkeypatch, tmp_path):
+    """Only the flag path stripped and lowercased, so "NVIDIA " from a file
+    behaved identically but hashed to a different cache key."""
+    cfg = _load_with_user_config(monkeypatch, tmp_path, 'provider: " NVIDIA "' + chr(10))
+
+    assert cfg.provider == "nvidia"
+
+
+def test_a_base_url_is_normalised(monkeypatch, tmp_path):
+    """--base-url normalises; a config file did not, so the same endpoint
+    written with a trailing slash was a second cache entry and a second bill."""
+    cfg = _load_with_user_config(
+        monkeypatch, tmp_path, "base_url: https://api.example.com/v1/ " + chr(10))
+
+    assert cfg.base_url == "https://api.example.com/v1"
+
+
+def test_a_model_is_stripped(monkeypatch, tmp_path):
+    cfg = _load_with_user_config(monkeypatch, tmp_path, 'model: "  a/b  "' + chr(10))
+
+    assert cfg.model == "a/b"
+
+
+# ---------------------------------------------------------------------------
+# Preset reconciliation: a provider name means the same thing in every layer
+# ---------------------------------------------------------------------------
+
+def test_a_config_file_provider_brings_its_endpoint_and_key_var(monkeypatch, tmp_path):
+    """The flag path has always reseeded these; a config file did not. So
+    uncommenting only `provider: openai` sent the NVIDIA key to NVIDIA's
+    endpoint while every error message said "rejected by openai" - and split
+    the cache key, re-billing the same commits. The shipped changelog.yml
+    advertises exactly this, listing provider: as its own commentable line."""
+    cfg = _load_with_user_config(monkeypatch, tmp_path, "provider: openai" + chr(10))
+
+    assert cfg.provider == "openai"
+    assert cfg.base_url == "https://api.openai.com/v1"
+    assert cfg.api_key_env == "OPENAI_API_KEY"
+
+
+def test_a_config_file_tts_provider_brings_its_own_settings(monkeypatch, tmp_path):
+    """Worse on the speech side: tts_provider: elevenlabs alone sent
+    OPENAI_API_KEY as an xi-api-key header with a Magpie voice name."""
+    cfg = _load_with_user_config(monkeypatch, tmp_path, "tts_provider: elevenlabs" + chr(10))
+
+    assert cfg.tts_api_key_env == "ELEVENLABS_API_KEY"
+    assert cfg.tts_voice == ""          # per-account; no sensible default
+    assert cfg.tts_model == ""
+    assert cfg.tts_base_url == ""
+
+
+def test_an_explicit_value_beats_the_preset_in_the_same_layer(monkeypatch, tmp_path):
+    """Reconciliation fills what a layer left unsaid; it never overrides what
+    the layer actually said."""
+    cfg = _load_with_user_config(
+        monkeypatch, tmp_path,
+        "provider: openai" + chr(10) + "api_key_env: WORK_OPENAI_KEY" + chr(10))
+
+    assert cfg.base_url == "https://api.openai.com/v1"   # filled
+    assert cfg.api_key_env == "WORK_OPENAI_KEY"          # kept
+
+
+def test_restating_the_current_provider_keeps_a_customised_endpoint(monkeypatch, tmp_path):
+    """The rule is per-layer and fires only on a *change*. The wizard writes a
+    hand-typed base_url next to provider: nvidia; an unconditional reseed would
+    silently undo it, which is the regression this guard has always covered -
+    now at the config layer as well as the flag layer."""
+    cfg = _load_with_user_config(
+        monkeypatch, tmp_path,
+        "provider: nvidia" + chr(10) + "base_url: https://my-proxy.test/v1" + chr(10)
+        + "api_key_env: WORK_NVIDIA_KEY" + chr(10))
+
+    assert cfg.base_url == "https://my-proxy.test/v1"
+    assert cfg.api_key_env == "WORK_NVIDIA_KEY"
+
+
+def test_a_project_file_can_switch_provider_over_the_user_file(monkeypatch, tmp_path):
+    """Layers reconcile independently, in order."""
+    monkeypatch.chdir(tmp_path)
+    _write_user_config("provider: openai" + chr(10))
+    (tmp_path / "changelog.yml").write_text("provider: groq" + chr(10), encoding="utf-8")
+
+    cfg = load(None)
+
+    assert cfg.provider == "groq"
+    assert cfg.base_url == "https://api.groq.com/openai/v1"
+    assert cfg.api_key_env == "GROQ_API_KEY"
+
+
+def test_tts_provider_none_means_do_not_speak(monkeypatch, tmp_path):
+    """`none` is offered by the wizard and accepted by --tts-provider, but from
+    a config file it left speak: true and reached tts.speak(), which called it
+    "unknown" on every run and listed choices that excluded it."""
+    cfg = _load_with_user_config(monkeypatch, tmp_path, "tts_provider: none" + chr(10))
+
+    assert cfg.speak is False
+
+
+def test_none_wins_over_a_speak_set_in_the_same_layer(monkeypatch, tmp_path):
+    """`none` is not a backend, it is the absence of one - so "speak" and
+    "there is nothing to speak with" cannot both hold. Resolving it per layer
+    meant a file setting both left speak on, and tts.speak() then raised
+    "unknown tts_provider 'none'" on every single run."""
+    cfg = _load_with_user_config(
+        monkeypatch, tmp_path,
+        "tts_provider: none" + chr(10) + "speak: true" + chr(10))
+
+    assert cfg.speak is False
+
+
+def test_none_in_a_lower_layer_still_wins(monkeypatch, tmp_path):
+    """The rule is about the resolved value, not about one layer: a project
+    file turning speech on cannot conjure a backend the user config removed."""
+    monkeypatch.chdir(tmp_path)
+    _write_user_config("tts_provider: none" + chr(10))
+    (tmp_path / "changelog.yml").write_text("speak: true" + chr(10), encoding="utf-8")
+
+    assert load(None).speak is False
+
+
+def test_a_real_backend_still_honours_speak_false(monkeypatch, tmp_path):
+    """The guard must not become "speak is always derived"."""
+    cfg = _load_with_user_config(
+        monkeypatch, tmp_path,
+        "tts_provider: openai" + chr(10) + "speak: false" + chr(10))
+
+    assert cfg.speak is False
+
+
+# ---------------------------------------------------------------------------
+# Switching to custom: whose key variable is it?
+# ---------------------------------------------------------------------------
+
+def test_custom_keeps_a_key_var_the_user_configured(monkeypatch, tmp_path):
+    """Blanking on a switch is right when the value was inherited from another
+    provider's preset - that is what stopped an NVIDIA key reaching an
+    arbitrary host. It is wrong when the user named the variable themselves:
+    custom's preset says nothing about keys, so it cannot overrule them, and
+    doing so broke a working endpoint with a 401 blamed on "custom"."""
+    monkeypatch.chdir(tmp_path)
+    _write_user_config("api_key_env: MY_COMPANY_KEY" + chr(10))
+
+    cfg = load(None, {"provider": "custom", "base_url": "https://mine.example/v1"},
+               {"provider": "--provider"})
+
+    assert cfg.api_key_env == "MY_COMPANY_KEY"
+
+
+def test_custom_still_drops_a_key_var_it_inherited(monkeypatch, tmp_path):
+    """The leak case, unchanged: nothing named this variable for this endpoint."""
+    monkeypatch.chdir(tmp_path)
+    _write_user_config("model: m" + chr(10))          # api_key_env from DEFAULTS
+
+    cfg = load(None, {"provider": "custom", "base_url": "https://proxy.example/v1"},
+               {"provider": "--provider"})
+
+    assert cfg.api_key_env == ""
+
+
+def test_custom_drops_a_key_var_another_preset_supplied(monkeypatch, tmp_path):
+    """provider: openai seeds OPENAI_API_KEY; switching to custom must not
+    carry it over just because a layer recorded it."""
+    monkeypatch.chdir(tmp_path)
+    _write_user_config("provider: openai" + chr(10))
+
+    cfg = load(None, {"provider": "custom", "base_url": "https://proxy.example/v1"},
+               {"provider": "--provider"})
+
+    assert cfg.api_key_env == ""
+
+
+def test_an_explicit_key_var_on_the_command_line_wins(monkeypatch, tmp_path):
+    cfg = _load_with_user_config(monkeypatch, tmp_path, "model: m" + chr(10))
+    cfg = load(None, {"provider": "custom", "base_url": "https://p.example/v1",
+                      "api_key_env": "MY_KEY"},
+               {"provider": "--provider", "api_key_env": "--api-key-env"})
+
+    assert cfg.api_key_env == "MY_KEY"
+
+
+def test_switching_between_real_providers_still_reseeds(monkeypatch, tmp_path):
+    """A non-empty preset value always wins - that is the ordinary switch."""
+    monkeypatch.chdir(tmp_path)
+    _write_user_config("api_key_env: MY_COMPANY_KEY" + chr(10))
+
+    cfg = load(None, {"provider": "groq"}, {"provider": "--provider"})
+
+    assert cfg.api_key_env == "GROQ_API_KEY"

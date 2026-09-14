@@ -11,9 +11,10 @@ from __future__ import annotations
 import os
 import re
 
+from voicelog import fileio
+
 MARKER_RE = re.compile(r"^<!-- voicelog:last-tag=(.*?) -->\s*$")
 UNRELEASED_RE = re.compile(r"^## Unreleased\b")
-BLOCK_BOUNDARY_RE = re.compile(r"^## ", re.MULTILINE)
 
 
 DEFAULT_VOICE_MD = os.path.join(".changelog", "voice.md")
@@ -97,14 +98,15 @@ def update_voice_md(
     fresh = _normalize_block(new_unreleased_md)
 
     if not os.path.exists(path):
-        new_content = f"{marker}\n{fresh}"
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(new_content)
+        fileio.atomic_write_text(path, f"{marker}\n{fresh}")
         return True
 
-    with open(path, "r", encoding="utf-8") as f:
-        existing = f.read()
+    # Strict, unlike every other read in the package: this value is decoded,
+    # edited and written back, so errors="replace" would not tolerate a bad
+    # byte - it would bake U+FFFD into the released history permanently, in the
+    # one file voicelog cannot regenerate. Refusing leaves the file untouched.
+    with open(path, "r", encoding="utf-8") as fh:
+        existing = fh.read()
 
     stored_tag, body = _parse_marker(existing)
     current_str = current_tag if current_tag is not None else "none"
@@ -145,6 +147,8 @@ def update_voice_md(
     if new_content == existing:
         return False
 
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(new_content)
+    # Atomic, like config/cache/state - and with more reason than any of
+    # them. Those three are disposable; this is accumulating history a user
+    # cannot regenerate, and it was the only writer that truncated first.
+    fileio.atomic_write_text(path, new_content)
     return True

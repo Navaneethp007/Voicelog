@@ -13,10 +13,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import sys
 from dataclasses import dataclass
 
-from voicelog import state
+from voicelog import fileio, state
 from voicelog.models import Commit
 
 
@@ -55,6 +56,36 @@ def _read(repo_dir: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _clear_read_only(path: str) -> bool:
+    """Drop a read-only flag on ``path``. Returns whether anything changed.
+
+    Only worth doing for a file we own outright: the cache is voicelog's own
+    scratch data in the repo's git directory, so a read-only bit on it is an
+    accident (a restore, a sync tool, a stray attrib) rather than an intention.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return False
+    if mode & stat.S_IWRITE:
+        return False
+    try:
+        os.chmod(path, mode | stat.S_IWRITE)
+    except OSError:
+        return False
+    return True
+
+
+def _warn_unwritable(exc: OSError) -> bool:
+    """Report a cache write we could not make, and what it costs."""
+    print(
+        f"warning: could not write the generation cache ({exc}); "
+        "this run will not be reused, and --replay will not have it.",
+        file=sys.stderr,
+    )
+    return False
+
+
 def _write(repo_dir: str, data: dict) -> bool:
     """Persist the cache. Returns whether it worked; never raises.
 
@@ -67,23 +98,19 @@ def _write(repo_dir: str, data: dict) -> bool:
       so an interrupt mid-write would truncate a generation already paid for.
     """
     path = _cache_path(repo_dir)
-    tmp = f"{path}.tmp"
+    payload = json.dumps(data)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(data, fh)
-        os.replace(tmp, path)
+        fileio.atomic_write_text(path, payload)
     except OSError as exc:
+        if not _clear_read_only(path):
+            return _warn_unwritable(exc)
+        # A read-only cache.json in a writable directory is the one failure
+        # here that repeats forever and that we can actually repair. Left
+        # alone it made every future run re-pay for an identical range.
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        print(
-            f"warning: could not write the generation cache ({exc}); "
-            "this run will not be reused.",
-            file=sys.stderr,
-        )
-        return False
+            fileio.atomic_write_text(path, payload)
+        except OSError as exc2:
+            return _warn_unwritable(exc2)
     return True
 
 
@@ -182,9 +209,13 @@ def last(repo_dir: str) -> LastEntry | None:
 def get(repo_dir: str, key: str) -> str | None:
     """Return the cached changelog markdown for ``key``, or None on miss."""
     data = _read(repo_dir)
-    if data.get("key") == key:
-        return data.get("markdown")
-    return None
+    if data.get("key") != key:
+        return None
+    # Shape-checked like last() and get_summary(): the key gate proves the entry
+    # is ours, not that its contents survived an interrupted write or a
+    # hand-edit, and a non-string here reached render.render().
+    markdown = data.get("markdown")
+    return markdown if isinstance(markdown, str) else None
 
 
 def put(repo_dir: str, key: str, markdown: str) -> bool:
@@ -196,12 +227,26 @@ def put(repo_dir: str, key: str, markdown: str) -> bool:
     return _write(repo_dir, {"key": key, "markdown": markdown, "summaries": {}})
 
 
+def _summaries(data: dict) -> dict:
+    """The summaries mapping from a cache entry, or {} if it is not one.
+
+    ``data.get("summaries", {})`` returns the *stored* value whenever the key is
+    present, so a null or a list - from an interrupted write, a hand-edit, an
+    older layout - reached ``.get`` and raised. ``last()`` shape-checks this
+    exact field and explains why; the key-gated readers skipped the check on the
+    grounds that the key gate fails first, which it does not for a matching key.
+    """
+    summaries = data.get("summaries")
+    return summaries if isinstance(summaries, dict) else {}
+
+
 def get_summary(repo_dir: str, key: str, detail: bool) -> str | None:
     """Return the cached spoken summary for ``key``+``detail``, or None on miss."""
     data = _read(repo_dir)
     if data.get("key") != key:
         return None
-    return data.get("summaries", {}).get(_slot(detail))
+    text = _summaries(data).get(_slot(detail))
+    return text if isinstance(text, str) else None
 
 
 def put_summary(repo_dir: str, key: str, detail: bool, text: str) -> bool:
@@ -209,5 +254,7 @@ def put_summary(repo_dir: str, key: str, detail: bool, text: str) -> bool:
     data = _read(repo_dir)
     if data.get("key") != key:
         return False  # markdown for this key isn't cached; nothing to attach to
-    data.setdefault("summaries", {})[_slot(detail)] = text
+    summaries = _summaries(data)
+    summaries[_slot(detail)] = text
+    data["summaries"] = summaries
     return _write(repo_dir, data)

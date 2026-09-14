@@ -67,3 +67,21 @@ def test_framing_text_appears_when_files_present(tmp_path):
     (tmp_path / "sample.md").write_text("Some changelog")
     result = load_voice(str(tmp_path))
     assert "Here are past changelogs" in result
+
+
+def test_a_sample_with_undecodable_bytes_does_not_kill_the_run(tmp_path):
+    """Voice samples are user files that may come from anywhere. A strict
+    decode made one stray byte fatal to a command that had not yet printed
+    anything - and UnicodeDecodeError is a ValueError, so the OSError guards
+    around this call site would not have caught it either."""
+    (tmp_path / "sample.md").write_bytes(b"# Release caf" + bytes([0xE9]) + b" notes")
+
+    result = load_voice(str(tmp_path))
+
+    assert "Release caf" in result
+
+
+def test_a_valid_non_ascii_sample_is_preserved(tmp_path):
+    (tmp_path / "sample.md").write_bytes("# Notes — café ☕".encode("utf-8"))
+
+    assert "café ☕" in load_voice(str(tmp_path))

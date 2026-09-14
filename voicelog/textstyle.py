@@ -68,8 +68,12 @@ _INLINE_RE = re.compile(
 #                           constantly
 
 
-def _enable_windows_vt() -> bool:
-    """Turn on ANSI interpretation for the Windows console, if it is one.
+def _enable_windows_vt(stream=None) -> bool:
+    """Turn on ANSI interpretation for ``stream``'s console, if it is one.
+
+    Takes the stream because it used to query and mutate STD_OUTPUT_HANDLE
+    unconditionally: asking whether *stderr* could render bold both answered
+    about stdout and turned VT processing on for stdout as a side effect.
 
     CPython never sets this itself - PEP 528 gave us UTF-8 console output, not
     escape-sequence handling. Asking the OS beats guessing from WT_SESSION or
@@ -79,11 +83,15 @@ def _enable_windows_vt() -> bool:
     """
     ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
     STD_OUTPUT_HANDLE = -11
+    STD_ERROR_HANDLE = -12
     try:
         import ctypes
 
         kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        which = STD_OUTPUT_HANDLE
+        if stream is not None and stream is getattr(sys, "stderr", None):
+            which = STD_ERROR_HANDLE
+        handle = kernel32.GetStdHandle(which)
         mode = ctypes.c_uint32()
         if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
             return False  # not a real console
@@ -123,7 +131,7 @@ def supports_style(stream=None) -> bool:
         return False
     if os.environ.get("TERM") == "dumb":
         return False
-    return _enable_windows_vt() if sys.platform == "win32" else True
+    return _enable_windows_vt(stream) if sys.platform == "win32" else True
 
 
 def _code_spans(text: str, resume: str = "") -> str:

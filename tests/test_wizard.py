@@ -1356,3 +1356,221 @@ def test_a_default_that_is_not_on_offer_is_not_advertised(monkeypatch):
 
     assert chosen == "m/0"                      # Enter refused, then picked 1
     assert "Enter =" not in prompts[0]
+
+
+def test_a_non_decimal_digit_does_not_crash_the_picker(monkeypatch):
+    """"2".isdigit() is True for a superscript two, but int() rejects it - so a
+    stray character raised ValueError mid-setup and lost every answer already
+    given. isdecimal() is the predicate that matches int()."""
+    prompts = []
+
+    def _input(prompt=""):
+        prompts.append(prompt)
+        assert len(prompts) < 4, "picker did not recover"
+        return chr(178) if len(prompts) == 1 else "1"      # superscript two
+
+    monkeypatch.setattr("builtins.input", _input)
+
+    assert wizard.ask_choice("Pick?", OPTIONS) == "a"
+
+
+def test_a_non_decimal_digit_is_treated_as_a_filter(monkeypatch):
+    """It is text, so it narrows the list - and matches nothing here."""
+    prompts = []
+
+    def _input(prompt=""):
+        prompts.append(prompt)
+        assert len(prompts) < 4
+        return chr(178) if len(prompts) == 1 else "1"
+
+    monkeypatch.setattr("builtins.input", _input)
+    wizard.ask_choice("Pick?", OPTIONS)
+
+
+# ---------------------------------------------------------------------------
+# The wizard must not accept what the writer will drop
+# ---------------------------------------------------------------------------
+
+def _first_prompt_only(monkeypatch, *replies):
+    """Script the opening prompts, then abort - for tests about a default."""
+    prompts = []
+
+    def _input(prompt=""):
+        prompts.append(prompt)
+        if len(prompts) > len(replies):
+            raise EOFError          # becomes SetupAborted
+        return replies[len(prompts) - 1]
+
+    monkeypatch.setattr("builtins.input", _input)
+    return prompts
+
+
+def test_a_base_url_without_a_scheme_is_re_prompted(monkeypatch, capsys):
+    """Typing localhost:11434/v1 - the standard Ollama paste - was accepted,
+    echoed in the Summary and reported "Saved", then silently dropped by
+    save_user_config's repair loop. The effective base_url fell back to
+    NVIDIA's, so a local model id and whatever key was in the environment
+    went there."""
+    _prompting_possible(monkeypatch)
+    prompts = _first_prompt_only(
+        monkeypatch,
+        "5",                          # provider: ollama (needs no key)
+        "localhost:11434/v1",         # no scheme - must be refused
+        "http://localhost:11434/v1",  # corrected
+    )
+
+    with mock.patch.object(providers, "fetch_models", return_value=["a/one"]):
+        with pytest.raises(SetupAborted):
+            wizard._choose_llm(_current())
+
+    # The URL prompt appeared twice: refused once, accepted once.
+    url_prompts = [p for p in prompts if "base URL" in p]
+    assert len(url_prompts) == 2
+    assert "scheme" in capsys.readouterr().out.lower()
+
+
+def test_a_valid_base_url_is_accepted_first_time(monkeypatch):
+    """The guard must not re-prompt on a good value."""
+    _prompting_possible(monkeypatch)
+    prompts = _first_prompt_only(monkeypatch, "5", "http://localhost:11434/v1")
+
+    with mock.patch.object(providers, "fetch_models", return_value=["a/one"]):
+        with pytest.raises(SetupAborted):
+            wizard._choose_llm(_current())
+
+    assert len([p for p in prompts if "base URL" in p]) == 1
+
+
+def test_whatever_the_wizard_accepts_the_writer_keeps(monkeypatch, tmp_path):
+    """The property that was broken: two validators with two opinions."""
+    from voicelog import config as config_module
+    monkeypatch.chdir(tmp_path)
+    accepted = config_module.check_value("base_url", "http://localhost:11434/v1")
+
+    config_module.save_user_config({"base_url": accepted, "model": "m"})
+
+    assert config_module.read_user_config()["base_url"] == accepted
+
+
+# ---------------------------------------------------------------------------
+# Re-running setup must not switch a voice backend behind your back
+# ---------------------------------------------------------------------------
+
+def test_a_configured_voice_backend_is_the_default(monkeypatch):
+    """_LLM_TO_TTS[llm_provider] was consulted first and "riva" is truthy, so an
+    ElevenLabs user re-running --setup to change only the model was switched
+    back to Riva by pressing Enter - blanking voice, model and base_url."""
+    _prompting_possible(monkeypatch)
+    prompts = _first_prompt_only(monkeypatch)
+
+    with pytest.raises(SetupAborted):
+        wizard._choose_tts(
+            _current_with(tts_provider="elevenlabs",
+                          tts_api_key_env="ELEVENLABS_API_KEY",
+                          tts_voice="my-voice-id"),
+            "NVIDIA_API_KEY", "nvidia")
+
+    assert "Enter = elevenlabs" in prompts[0]
+
+
+def test_a_fresh_machine_still_gets_the_llm_affinity(monkeypatch):
+    """With nothing configured, choosing OpenAI for text should suggest OpenAI
+    for speech - that is what the affinity table is for, and it must survive."""
+    _prompting_possible(monkeypatch)
+    prompts = _first_prompt_only(monkeypatch)
+
+    with pytest.raises(SetupAborted):
+        wizard._choose_tts(_current(), "OPENAI_API_KEY", "openai")
+
+    assert "Enter = openai" in prompts[0]
+
+
+def test_setx_warns_about_the_exposure_before_running(monkeypatch, capsys):
+    """setx passes the key as a command-line argument: readable from any
+    process listing for the child's lifetime, and written permanently to the
+    Security event log where 4688 auditing is on. Worth a sentence before we
+    do it, since the module docstring promises a key is never written down."""
+    monkeypatch.setattr(wizard.os, "name", "nt")
+    monkeypatch.setattr(wizard.subprocess, "run",
+                        lambda *a, **k: mock.Mock(returncode=0))
+
+    assert wizard._persist_key("MY_KEY", "sk-secret") is True
+
+    out = capsys.readouterr().out
+    assert "process" in out.lower() or "visible" in out.lower()
+    assert "sk-secret" not in out          # still never echoes the key itself
+
+
+# ---------------------------------------------------------------------------
+# SetupAborted records which way out the user took
+# ---------------------------------------------------------------------------
+
+def test_eof_at_a_prompt_is_not_an_interrupt(monkeypatch):
+    """Callers need to tell them apart: EOF means "skip this question", Ctrl-C
+    means "stop the command". One exception type for both meant whoever
+    swallowed it swallowed the interrupt too."""
+    monkeypatch.setattr("builtins.input",
+                        lambda prompt="": (_ for _ in ()).throw(EOFError))
+
+    with pytest.raises(SetupAborted) as exc:
+        wizard.ask_text("Anything?")
+
+    assert exc.value.interrupted is False
+
+
+def test_ctrl_c_at_a_prompt_is_an_interrupt(monkeypatch):
+    monkeypatch.setattr("builtins.input",
+                        lambda prompt="": (_ for _ in ()).throw(KeyboardInterrupt))
+
+    with pytest.raises(SetupAborted) as exc:
+        wizard.ask_text("Anything?")
+
+    assert exc.value.interrupted is True
+
+
+def test_ctrl_c_at_a_secret_prompt_is_an_interrupt(monkeypatch):
+    """ask_secret has its own reader, so it needs the same distinction."""
+    monkeypatch.setattr(wizard.getpass, "getpass",
+                        lambda prompt="": (_ for _ in ()).throw(KeyboardInterrupt))
+
+    with pytest.raises(SetupAborted) as exc:
+        wizard.ask_secret("Paste: ")
+
+    assert exc.value.interrupted is True
+
+
+def test_declining_to_save_is_not_an_interrupt():
+    """run_setup raises this itself when the user answers no."""
+    assert SetupAborted().interrupted is False
+
+
+# ---------------------------------------------------------------------------
+# Pressing Enter must never dead-end on a prompt with no default
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("llm_provider",
+                         ["nvidia", "openai", "groq", "openrouter", "ollama", "custom"])
+def test_the_voice_prompt_always_offers_a_default(monkeypatch, llm_provider):
+    """Blanking a stored tts_provider that equals the built-in default fixed
+    the ElevenLabs switch, but left the providers with no speech affinity -
+    Groq, OpenRouter, Ollama, custom - with no default at all, contradicting
+    the invariant stated ten lines below it."""
+    _prompting_possible(monkeypatch)
+    prompts = _first_prompt_only(monkeypatch)
+
+    with pytest.raises(SetupAborted):
+        wizard._choose_tts(_current(), "SOME_KEY", llm_provider)
+
+    assert "Enter = " in prompts[0], prompts[0]
+
+
+def test_a_configured_backend_still_beats_the_affinity(monkeypatch):
+    """The ElevenLabs fix must survive the dead-end fix."""
+    _prompting_possible(monkeypatch)
+    prompts = _first_prompt_only(monkeypatch)
+
+    with pytest.raises(SetupAborted):
+        wizard._choose_tts(_current_with(tts_provider="elevenlabs"),
+                           "NVIDIA_API_KEY", "nvidia")
+
+    assert "Enter = elevenlabs" in prompts[0]

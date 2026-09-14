@@ -26,6 +26,7 @@ import warnings
 from typing import Any, Sequence
 
 from voicelog import config as config_module
+from voicelog import fileio
 from voicelog import providers
 from voicelog.providers import (
     CUSTOM_PROVIDER_KEY,
@@ -36,7 +37,19 @@ from voicelog.providers import (
 
 
 class SetupAborted(Exception):
-    """The user backed out: Ctrl-C, EOF, or declining to save."""
+    """The user backed out: Ctrl-C, EOF, or declining to save.
+
+    ``interrupted`` distinguishes Ctrl-C from the other two, because they are
+    different answers. EOF at the key prompt - or declining to save - answers
+    that question and nothing more, so the run continues. Ctrl-C answers the
+    whole command. One type for both meant whichever caller swallowed the
+    refusal swallowed the interrupt with it, and the run ploughed on through a
+    model call and a TTS attempt after the user had asked it to stop.
+    """
+
+    def __init__(self, *, interrupted: bool = False):
+        super().__init__()
+        self.interrupted = interrupted
 
 
 # Option values for the "this model failed its check" prompt. Deliberately
@@ -91,9 +104,29 @@ def _read_line(prompt: str) -> str:
     """
     try:
         return input(prompt)
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         print()
         raise SetupAborted() from None
+    except KeyboardInterrupt:
+        print()
+        raise SetupAborted(interrupted=True) from None
+
+
+def ask_valid(key: str, prompt: str, default: str = "") -> str:
+    """Prompt until the answer is one ``config`` accepts for ``key``.
+
+    The wizard used to judge values by its own lights and hand them to a writer
+    that judged them again, by different rules. Anything the two disagreed on
+    was accepted, confirmed, "saved", and then silently discarded.
+    """
+    while True:
+        answer = ask_text(prompt, default=default)
+        try:
+            return config_module.check_value(key, answer)
+        except config_module.ConfigValueInvalid as exc:
+            # reason is "<key>: <value> <what is wrong>"; the key is already in
+            # the prompt the user is looking at.
+            print(f"  {exc.reason.split(': ', 1)[-1]}")
 
 
 def ask_text(prompt: str, default: str = "", *, allow_empty: bool = False) -> str:
@@ -130,9 +163,12 @@ def ask_secret(prompt: str) -> str:
             print("  note: this terminal cannot hide input - the key was "
                   "visible as you typed it.")
         return value.strip().strip("'\"").strip()
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         print()
         raise SetupAborted() from None
+    except KeyboardInterrupt:
+        print()
+        raise SetupAborted(interrupted=True) from None
 
 
 def ask_yes_no(prompt: str, default: bool = True) -> bool:
@@ -198,7 +234,10 @@ def ask_choice(
             print("  Please choose one.")
             continue
 
-        if answer.isdigit():
+        # isdecimal, not isdigit: isdigit accepts superscripts and other
+        # numeric-looking characters that int() then rejects, so a stray
+        # one raised ValueError mid-setup and lost every answer so far.
+        if answer.isdecimal():
             index = int(answer)
             if 1 <= index <= len(rows):
                 return rows[index - 1][0]
@@ -278,6 +317,15 @@ def _persist_key(env_name: str, key: str) -> bool:
             print(f"  setx truncates values longer than {_SETX_MAX_CHARS} characters, "
                   "which would store a broken key. Set it yourself instead.")
             return False
+        # setx takes the value as a command-line argument, so for the life of
+        # that process it is visible to anything that can list processes, and on
+        # a machine with 4688 process-creation auditing enabled it is written to
+        # the Security event log permanently. Said out loud because this module
+        # promises a key is never written anywhere, and here it is written
+        # somewhere - the user should get to decide with that in hand.
+        print("  note: setx passes the key on a command line, so it is briefly "
+              "visible to other processes on this machine (and recorded if "
+              "process auditing is on).")
         try:
             result = subprocess.run(["setx", env_name, key], capture_output=True, text=True)
         except OSError as exc:
@@ -296,8 +344,7 @@ def _persist_key(env_name: str, key: str) -> bool:
 
     line = _export_line(env_name, key)
     try:
-        with open(profile, encoding="utf-8") as fh:
-            existing = fh.read()
+        existing = fileio.read_text(profile)
     except OSError:
         existing = ""
 
@@ -498,7 +545,8 @@ def _choose_llm(current: dict[str, Any]) -> dict[str, Any]:
     preset = providers.PROVIDERS[provider_key]
 
     if provider_key == CUSTOM_PROVIDER_KEY:
-        base_url = ask_text("Enter the base URL (OpenAI-compatible, usually ends in /v1)")
+        base_url = ask_valid(
+            "base_url", "Enter the base URL (OpenAI-compatible, usually ends in /v1)")
         api_key_env = ask_text(
             "Enter the name of the environment variable holding your key "
             "(blank if none needed)",
@@ -510,7 +558,7 @@ def _choose_llm(current: dict[str, Any]) -> dict[str, Any]:
             if current.get("provider") == provider_key and current.get("base_url")
             else preset.base_url
         )
-        base_url = ask_text("Enter the base URL", default=default_url)
+        base_url = ask_valid("base_url", "Enter the base URL", default=default_url)
         if preset.api_key_env:
             api_key_env = ask_text(
                 "Enter the name of the environment variable holding your key",
@@ -558,9 +606,14 @@ def _choose_llm(current: dict[str, Any]) -> dict[str, Any]:
 # Text providers that also offer speech. Everything else (Groq, OpenRouter,
 # Ollama) has no TTS of its own, which is why the menu reorders rather than
 # filters - filtering would leave those users with "no voice" as the only choice.
+# Derived rather than typed: a text provider pairs with the speech backend that
+# reads the same key variable, which is exactly what "you already have a key for
+# this" means. Written by hand it was a third provider table to keep in step.
 _LLM_TO_TTS = {
-    "nvidia": "riva",
-    "openai": "openai",
+    llm.key: speech.key
+    for llm in providers.PROVIDERS.values()
+    for speech in providers.TTS_PROVIDERS.values()
+    if llm.api_key_env and llm.api_key_env == speech.api_key_env
 }
 
 
@@ -668,9 +721,24 @@ def _choose_tts(
 ) -> dict[str, Any]:
     """The voice half of setup. Returns {"speak": False} if voice is declined."""
     options = _tts_options(llm_provider)
-    # Default to the service that matches the text provider, so the common case
-    # is one Enter; fall back to whatever is already configured.
-    default = _LLM_TO_TTS.get((llm_provider or "").lower()) or current.get("tts_provider")
+    # A backend the user actually configured wins over the affinity table. The
+    # affinity was consulted first and "riva" is truthy, so an ElevenLabs user
+    # re-running --setup to change only the model was switched back to Riva by
+    # pressing Enter, blanking their voice, model and base_url with it. A stored
+    # value equal to the built-in default is not a choice, so a fresh machine
+    # still gets the affinity and the common case is still one Enter.
+    configured = current.get("tts_provider") or ""
+    if configured == config_module.DEFAULTS["tts_provider"]:
+        configured = ""
+    # Three tiers, and the last one is what keeps the invariant below true:
+    # blanking a stored value that equals the built-in default left Groq,
+    # OpenRouter, Ollama and custom - the providers with no speech affinity -
+    # with no default at all, so Enter had nowhere to go.
+    default = (
+        configured
+        or _LLM_TO_TTS.get((llm_provider or "").lower())
+        or config_module.DEFAULTS["tts_provider"]
+    )
     tts_key = ask_choice(
         "Read changelogs aloud with which voice?",
         options,

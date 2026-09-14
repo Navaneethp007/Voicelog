@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+from voicelog import textstyle
+
 from voicelog.textstyle import style, supports_style
 
 BOLD = "\033[1m"
@@ -158,7 +160,7 @@ def test_empty_no_color_does_not_disable(monkeypatch):
     """no-color.org: the variable must be non-empty to count."""
     _plain_env(monkeypatch)
     monkeypatch.setenv("NO_COLOR", "")
-    monkeypatch.setattr("voicelog.textstyle._enable_windows_vt", lambda: True)
+    monkeypatch.setattr("voicelog.textstyle._enable_windows_vt", lambda stream=None: True)
     assert supports_style(_Stream(tty=True)) is True
 
 
@@ -218,3 +220,26 @@ def test_bold_and_a_separate_code_span_on_one_line():
     result = _styled("**bold** then `code`")
 
     assert result == f"{BOLD}bold{RESET} then {DIM}code{RESET}"
+
+
+def test_supports_style_does_not_consult_stdout_for_another_stream(monkeypatch):
+    """_enable_windows_vt always queried and mutated STD_OUTPUT_HANDLE, so
+    asking about stderr (or any other stream) answered about stdout - and it
+    never restored the console mode it changed."""
+    import io as _io
+
+    asked = []
+    monkeypatch.setattr(textstyle.sys, "platform", "win32")
+    monkeypatch.setattr(textstyle, "_enable_windows_vt",
+                        lambda stream=None: asked.append(stream) or True)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+
+    class _Tty(_io.StringIO):
+        def isatty(self):
+            return True
+
+    stream = _Tty()
+    textstyle.supports_style(stream)
+
+    assert asked == [stream]

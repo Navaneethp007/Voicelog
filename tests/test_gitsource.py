@@ -8,12 +8,13 @@ import subprocess
 
 import pytest
 
+from voicelog import gitsource
 from voicelog.gitsource import (
     NotAGitRepo,
-    NoCommitsFound,
     RefNotFound,
     GitResult,
     read_commits,
+    diff_for_commits,
     read_recent_commits,
     detect_base_branch,
     head_sha,
@@ -686,3 +687,123 @@ class TestIsAncestor:
         monkeypatch.chdir(repo)
 
         assert is_ancestor(feature_head) is False
+
+
+# ---------------------------------------------------------------------------
+# Decoding: git speaks UTF-8, the locale codepage is not consulted
+# ---------------------------------------------------------------------------
+
+def commit_message_bytes(run, repo, raw: bytes, filename="m.txt"):
+    """Commit with a message given as raw bytes, via -F.
+
+    Passing the message as a command-line argument would route it through the
+    console codepage on Windows and test the harness rather than gitsource.
+    A file is exactly the bytes we wrote.
+    """
+    msg = repo / "_msg"
+    msg.write_bytes(raw)
+    (repo / filename).write_text("data")
+    run("git", "add", filename)
+    run("git", "commit", "-F", str(msg))
+    os.remove(msg)
+
+
+class TestNonAsciiDecoding:
+    """subprocess text=True decodes with locale.getpreferredencoding(), which is
+    cp1252 on a default Windows box - so a Cyrillic commit subject came back as
+    mojibake and a byte undefined in cp1252 could kill the run outright."""
+
+    def test_a_cyrillic_subject_survives_the_round_trip(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        commit_message_bytes(run, repo, "feat: добавить поддержку".encode("utf-8"))
+        monkeypatch.chdir(repo)
+
+        assert read_commits().commits[0].subject == "feat: добавить поддержку"
+
+    def test_an_emoji_subject_survives(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        commit_message_bytes(run, repo, "feat: ship it 🚀".encode("utf-8"))
+        monkeypatch.chdir(repo)
+
+        assert "🚀" in read_commits().commits[0].subject
+
+    def test_undecodable_bytes_do_not_kill_the_run(self, tmp_path, monkeypatch):
+        """git accepts a non-UTF-8 commit message, so this is reachable.
+        errors="replace" makes it a mangled character rather than a dead run."""
+        repo, run = make_repo(tmp_path)
+        commit_message_bytes(run, repo, b"feat: caf" + bytes([0xE9]) + b" latte")
+        monkeypatch.chdir(repo)
+
+        result = read_commits()   # must not raise UnicodeDecodeError
+
+        assert result.commits
+        assert result.commits[0].subject.startswith("feat: caf")
+
+
+class TestGitMissing:
+    def test_a_missing_git_is_reported_not_tracebacked(self, tmp_path, monkeypatch):
+        """_run had no exception handling at all, so git off PATH raised a bare
+        FileNotFoundError - while state.py guarded the identical call."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            gitsource.subprocess, "run",
+            lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError(2, "not found")),
+        )
+
+        with pytest.raises(NotAGitRepo) as exc:
+            read_commits()
+
+        assert "git" in str(exc.value).lower()
+
+
+class TestDiffScoping:
+    def test_the_diff_ends_at_the_newest_commit_being_summarised(self, tmp_path, monkeypatch):
+        """_diff_for re-scoped only the oldest end while _get_diff hardcoded
+        ..HEAD, so a noise-filtered newest commit was dropped from the prompt
+        and the cache key while its code still went to the provider - against
+        both the function's "never a wider range" docstring and the flag's
+        opt-in framing."""
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, "a.txt", "a", "feat: keep me")
+        add_commit(run, repo, "b.txt", "b", "wip: secret experiment")
+        monkeypatch.chdir(repo)
+
+        kept = [c for c in read_commits().commits if not c.subject.startswith("wip")]
+        diff = diff_for_commits(kept)
+
+        assert "a.txt" in diff
+        assert "b.txt" not in diff        # filtered out, so its code must not ship
+
+    def test_an_unfiltered_range_still_reaches_head(self, tmp_path, monkeypatch):
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, "a.txt", "a", "feat: one")
+        add_commit(run, repo, "b.txt", "b", "feat: two")
+        monkeypatch.chdir(repo)
+
+        diff = diff_for_commits(read_commits().commits)
+
+        assert "a.txt" in diff and "b.txt" in diff
+
+
+class TestNumstatParsing:
+    def test_a_rename_is_recorded_as_the_new_path(self, tmp_path, monkeypatch):
+        """--numstat writes renames as "{old => new}", which reached the prompt
+        as a composite string where --name-only gave a plain path."""
+        repo, run = make_repo(tmp_path)
+        add_commit(run, repo, "old.txt", "content", "feat: add")
+        run("git", "mv", "old.txt", "new.txt")
+        run("git", "commit", "-m", "refactor: rename")
+        monkeypatch.chdir(repo)
+
+        files = read_commits().commits[0].files
+
+        assert not any("=>" in f for f in files), files
+        assert any(f.endswith("new.txt") for f in files), files
+
+    def test_a_malformed_count_does_not_crash(self):
+        from voicelog.gitsource import _parse_numstat_block
+
+        files, ins, dels = _parse_numstat_block("banana\tsplit\tfile.txt" + chr(10))
+
+        assert files == ["file.txt"]
+        assert (ins, dels) == (0, 0)

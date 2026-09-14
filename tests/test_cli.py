@@ -1,41 +1,50 @@
-﻿"""CLI wiring tests â€” focus on the Phase 2 contract: text output is never
+"""CLI wiring tests — focus on the Phase 2 contract: text output is never
 gated on TTS, and audio failure only warns."""
 from __future__ import annotations
 
+import dataclasses
 import os
 
 import pytest
 
 from voicelog import cli
-from voicelog.config import Config, DEFAULTS
+from voicelog import config as config_module
+from voicelog.config import DEFAULTS
 from voicelog.gitsource import GitResult, RefNotFound
 from voicelog.models import Commit
 from voicelog.tts import TTSError
 
 
 def _config():
-    return Config(
-        provider=DEFAULTS["provider"],
-        base_url=DEFAULTS["base_url"],
-        model="test-model",  # never DEFAULTS["model"]: there is no default model
-        sections=list(DEFAULTS["sections"]),
-        noise=list(DEFAULTS["noise"]),
-        voice_samples=DEFAULTS["voice_samples"],
-        fallback_commits=int(DEFAULTS["fallback_commits"]),
-        speak=DEFAULTS["speak"],
-        tts_function_id=DEFAULTS["tts_function_id"],
-        tts_voice=DEFAULTS["tts_voice"],
-        tts_language=DEFAULTS["tts_language"],
-        tts_sample_rate=DEFAULTS["tts_sample_rate"],
-        voice_md=DEFAULTS["voice_md"],
+    # defaults_config() rather than thirteen hand-passed fields: a fake that
+    # lists them itself drifts from the schema, and drifting fakes are what
+    # kept fourteen unreachable getattr guards alive in production.
+    return dataclasses.replace(
+        config_module.defaults_config(),
+        model="test-model",   # there is deliberately no default model
     )
+
+
+def _write_user_config(body: str) -> str:
+    """Write the user config conftest redirected VOICELOG_CONFIG_HOME to."""
+    path = cli.config_module.user_config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return path
 
 
 @pytest.fixture()
 def wired(monkeypatch, tmp_path):
     """Patch the whole pipeline so main() runs offline; cwd is a temp dir."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli.config_module, "load", lambda path: _config())
+    # Seed the real user config rather than stubbing config.load. Flags are a
+    # layer *inside* load now, so a stub would hide every preset rule, every
+    # membership check and every normalisation from these tests - which is what
+    # let the flag path and the file path drift apart in the first place.
+    # conftest points VOICELOG_CONFIG_HOME at tmp_path, so this writes nowhere
+    # real. The result equals _config(): DEFAULTS with one model set.
+    _write_user_config("model: test-model" + chr(10))
     monkeypatch.setattr(
         cli.gitsource,
         "read_commits",
@@ -52,7 +61,7 @@ def wired(monkeypatch, tmp_path):
         "generate",
         lambda commits, voice_text, cfg, diff=None: "## Unreleased\n\n### Features\n- A thing happened",
     )
-    # Spoken summary is a separate LLM call â€” stub it so tests stay offline.
+    # Spoken summary is a separate LLM call — stub it so tests stay offline.
     monkeypatch.setattr(cli.generate, "summarize", lambda md, cfg, detail=False: "A short spoken summary.")
     monkeypatch.setattr("sys.argv", ["voicelog"])
 
@@ -103,7 +112,7 @@ def test_speaks_on_normal_run(wired, monkeypatch, capsys):
 
 
 def test_default_run_does_not_write_voice_md(wired, monkeypatch, tmp_path):
-    """The default run is a transient rundown â€” no persistent changelog."""
+    """The default run is a transient rundown — no persistent changelog."""
     monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
 
     cli.main()
@@ -721,7 +730,7 @@ def test_new_mutually_exclusive_with_pull(wired, monkeypatch, capsys):
 
 
 def test_pull_mode_does_not_write_voice_md(wired, monkeypatch, tmp_path):
-    """Diff/pull mode is transient â€” it must not touch the release changelog."""
+    """Diff/pull mode is transient — it must not touch the release changelog."""
     monkeypatch.setattr(
         cli.gitsource,
         "read_commits",
@@ -1011,7 +1020,8 @@ def test_aborted_setup_writes_nothing(wired, monkeypatch, capsys):
         cli.main()
 
     assert exc.value.code == 1
-    assert cli.config_module.read_user_config() == {}
+    # wired seeds a user config, so "wrote nothing" means "left it alone".
+    assert cli.config_module.read_user_config() == {"model": "test-model"}
     assert "cancel" in capsys.readouterr().err.lower()
 
 
@@ -1116,7 +1126,7 @@ def test_speech_key_is_requested_when_it_differs_from_the_text_key(wired, monkey
     monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
     monkeypatch.setattr("sys.argv", ["voicelog", "--tts-provider", "elevenlabs"])
 
-    def _load(path):
+    def _load(path, overrides=None, overrides_origin=None):
         cfg = _config()
         cfg.tts_api_key_env = "ELEVENLABS_API_KEY"
         return cfg
@@ -1145,7 +1155,7 @@ def test_speech_key_is_not_requested_when_speech_is_off(wired, monkeypatch):
                         lambda env, **kw: asked.append(env) or True)
     monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
 
-    def _load(path):
+    def _load(path, overrides=None, overrides_origin=None):
         cfg = _config()
         cfg.tts_api_key_env = "ELEVENLABS_API_KEY"
         return cfg
@@ -1367,7 +1377,8 @@ def test_unreadable_target_still_prints_the_settings_to_save(monkeypatch, tmp_pa
 
 def _load_raises(monkeypatch, exc):
     monkeypatch.setattr(
-        cli.config_module, "load", lambda path: (_ for _ in ()).throw(exc)
+        cli.config_module, "load",
+        lambda path, *a, **k: (_ for _ in ()).throw(exc),
     )
 
 
@@ -1410,14 +1421,14 @@ def test_unreadable_config_exits_on_a_normal_run(monkeypatch, tmp_path, capsys):
 # ---------------------------------------------------------------------------
 
 def _load_config(monkeypatch, **fields):
-    """Make main() load a Config with these fields overridden."""
-    def _load(path):
-        cfg = _config()
-        for name, value in fields.items():
-            setattr(cfg, name, value)
-        return cfg
+    """Seed the user config with these values so main() loads them for real.
 
-    monkeypatch.setattr(cli.config_module, "load", _load)
+    This used to stub config.load. Flags are a layer *inside* load now, so a
+    stub silently drops every override the test is about - and hides the preset
+    reconciliation that makes a flag and a file agree.
+    """
+    import yaml
+    _write_user_config(yaml.safe_dump({"model": "test-model", **fields}))
 
 
 def test_restating_the_current_provider_keeps_a_customised_endpoint(wired, monkeypatch):
@@ -2307,31 +2318,8 @@ def test_tts_provider_none_still_turns_speech_off(wired, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The watermark must not advance past a generation nothing kept
+# The watermark and what it is gated on
 # ---------------------------------------------------------------------------
-
-def test_a_failed_cache_write_does_not_record(wired, monkeypatch, capsys):
-    """Advancing here loses the generation from both directions: --replay has
-    nothing cached and --since-last sees nothing new, so the only copy of a paid
-    summary is terminal scrollback. Re-generating next run is the lesser evil.
-
-    Reachable because state.record_summarised and the cache write can fail
-    independently: if the whole .git/voicelog directory is unwritable the
-    watermark write fails too, but a read-only cache.json alone leaves it fine.
-    """
-    recorded = _watermark(monkeypatch)
-    # Patch the underlying failure, not _write, so the real guard runs.
-    monkeypatch.setattr(cli.cache.os, "makedirs",
-                        lambda *a, **k: (_ for _ in ()).throw(OSError("read-only")))
-    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
-
-    cli.main()
-
-    assert recorded == []
-    out = capsys.readouterr()
-    assert "## Unreleased" in out.out     # the text still printed
-    assert "cache" in out.err.lower()
-
 
 def test_a_successful_cache_write_still_records(wired, monkeypatch):
     """The gate must not freeze the watermark on the ordinary path."""
@@ -2341,3 +2329,425 @@ def test_a_successful_cache_write_still_records(wired, monkeypatch):
     cli.main()
 
     assert recorded == ["a" * 40]
+
+
+# ---------------------------------------------------------------------------
+# The watermark and a cache write that cannot be made
+# ---------------------------------------------------------------------------
+
+def test_a_permanently_failed_cache_write_still_records(wired, monkeypatch, capsys):
+    """Reverses the gate added two rounds ago. The reasoning behind it - that
+    record_summarised writes to the same .git/voicelog directory, so nothing
+    could freeze the watermark alone - was directory-level reasoning applied to
+    a file-level failure: a read-only cache.json in a writable directory fails
+    forever while the watermark write succeeds. Holding the watermark back then
+    re-bills generation AND summary on every future run for an identical range,
+    which costs more than the one run's recoverability it was protecting. The
+    text was printed, and the warning says what was lost."""
+    recorded = _watermark(monkeypatch)
+    monkeypatch.setattr(cli.cache.fileio, "atomic_write_text",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("read-only")))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
+
+    cli.main()
+
+    assert recorded == ["a" * 40]
+    out = capsys.readouterr()
+    assert "## Unreleased" in out.out
+    assert "--replay" in out.err
+
+
+def test_an_unwritable_voice_md_still_holds_the_watermark(wired, monkeypatch):
+    """The other half of the gate stays: voice.md is the persistent changelog,
+    it is now written atomically, and a failure there is worth retrying."""
+    recorded = _watermark(monkeypatch)
+    monkeypatch.setattr(cli.voicefile, "update_voice_md",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("read-only")))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak", "--changelog"])
+
+    cli.main()
+
+    assert recorded == []
+
+
+# ---------------------------------------------------------------------------
+# Ctrl-D at a key prompt is an answer, not a crash
+# ---------------------------------------------------------------------------
+
+def _aborting_key_prompt(monkeypatch):
+    monkeypatch.setattr(cli.wizard, "ensure_key",
+                        lambda *a, **k: (_ for _ in ()).throw(cli.wizard.SetupAborted()))
+
+
+def test_ctrl_d_at_the_key_prompt_does_not_traceback(wired, monkeypatch, capsys):
+    """SetupAborted was caught in exactly one place, inside _run_setup. On the
+    ordinary path a fresh shell with no key set prints the paste prompt, and
+    Ctrl-D there gave a bare voicelog.wizard.SetupAborted traceback."""
+    _aborting_key_prompt(monkeypatch)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
+
+    cli.main()          # must not raise
+
+    assert "## Unreleased" in capsys.readouterr().out
+
+
+def test_declining_the_key_prompt_still_runs(wired, monkeypatch, capsys):
+    """Declining to paste a key is not declining the command: generation either
+    works with a key already in the environment or fails with its own message."""
+    _aborting_key_prompt(monkeypatch)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
+
+    cli.main()
+
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_ctrl_d_at_the_speech_key_prompt_does_not_traceback(wired, monkeypatch):
+    """_ensure_speech_key is the second uncaught call site."""
+    calls = []
+
+    def _ensure(env, **kw):
+        calls.append(env)
+        if len(calls) > 1:          # the speech prompt, after the text one
+            raise cli.wizard.SetupAborted()
+        return True
+
+    monkeypatch.setattr(cli.wizard, "ensure_key", _ensure)
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+    _load_config(monkeypatch, tts_api_key_env="OTHER_KEY")
+
+    cli.main()          # must not raise
+
+
+def test_ctrl_d_during_a_replay_does_not_traceback(wired, monkeypatch, tmp_path):
+    """--replay reaches the speech-key prompt too."""
+    _cached(tmp_path, brief="words")
+    _aborting_key_prompt(monkeypatch)
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--replay"])
+
+    cli.main()          # must not raise
+
+
+def test_setup_on_a_first_run_does_not_kill_the_typed_command(wired, monkeypatch, capsys):
+    """_run_setup(resume=True) exits 1 when the config cannot be written, while
+    the SetupAborted handler six lines above deliberately returns. An unwritable
+    home on a first run killed the command the user actually typed."""
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr(cli.wizard, "run_setup", lambda current, dest=None: {"model": "m"})
+    monkeypatch.setattr(cli.config_module, "save_user_config",
+                        lambda values: (_ for _ in ()).throw(OSError("read-only home")))
+
+    assert cli._run_setup(_args(), _config(), resume=True) is None
+
+    err = capsys.readouterr().err
+    assert "model: m" in err        # the answers are still printed to keep
+
+
+# ---------------------------------------------------------------------------
+# One validator, two exit codes
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("flag, value", [
+    ("--provider", "openia"),
+    ("--tts-provider", "bananas"),
+])
+def test_an_unknown_provider_flag_still_exits_2(wired, monkeypatch, capsys, flag, value):
+    """Membership now lives in config, with the file path, but a bad *flag* is
+    a usage error and argparse's convention for that is 2 - scripts read it."""
+    monkeypatch.setattr("sys.argv", ["voicelog", flag, value, "--no-speak"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert flag in err          # names the flag, not a config file path
+    assert value in err
+
+
+def test_a_bad_value_in_a_file_still_exits_1(wired, monkeypatch, capsys):
+    """The same validator, a different origin, the documented exit code."""
+    _write_user_config("provider: openia" + chr(10))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+
+
+def test_switching_to_custom_does_not_carry_the_old_key_var(wired, monkeypatch):
+    """--provider custom --base-url <host> used to keep whatever api_key_env
+    was configured, so an NVIDIA key went to an arbitrary host with no warning.
+    Custom's preset names no key, and reconciliation now applies that."""
+    seen = _capture_cfg(monkeypatch)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--provider", "custom",
+                                     "--base-url", "https://some-proxy.example/v1",
+                                     "--no-speak"])
+
+    cli.main()
+
+    assert seen["cfg"].base_url == "https://some-proxy.example/v1"
+    assert seen["cfg"].api_key_env == ""      # nothing to send
+
+
+def test_custom_can_still_name_a_key_var_explicitly(wired, monkeypatch):
+    """Fail-closed, not locked shut."""
+    seen = _capture_cfg(monkeypatch)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--provider", "custom",
+                                     "--base-url", "https://some-proxy.example/v1",
+                                     "--api-key-env", "MY_PROXY_KEY", "--no-speak"])
+
+    cli.main()
+
+    assert seen["cfg"].api_key_env == "MY_PROXY_KEY"
+
+
+def test_naming_a_voice_does_not_revive_tts_provider_none(wired, monkeypatch):
+    """--voice seeded speak: True into the same flag layer as
+    --tts-provider none, so the "no backend" rule never fired: every run
+    printed "Speaking..." and then raised unknown tts_provider 'none'."""
+    seen = _capture_cfg(monkeypatch)
+    monkeypatch.setattr(cli.tts, "speak",
+                        lambda text, config: pytest.fail("spoke with no backend"))
+    monkeypatch.setattr("sys.argv",
+                        ["voicelog", "--tts-provider", "none", "--voice", "nova"])
+
+    cli.main()
+
+    assert seen["cfg"].speak is False
+
+
+def test_a_voice_flag_alone_still_turns_speech_on(wired, monkeypatch):
+    """The fix must not disarm --voice in the ordinary case."""
+    seen = _capture_cfg(monkeypatch)
+    monkeypatch.setattr(cli.tts, "speak", lambda text, config: None)
+    _load_config(monkeypatch, speak=False)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--voice", "nova"])
+
+    cli.main()
+
+    assert seen["cfg"].speak is True
+
+
+# ---------------------------------------------------------------------------
+# The provider-switch warning names a real switch
+# ---------------------------------------------------------------------------
+
+def test_switching_provider_warns_that_it_reuses_the_configured_model(
+    wired, monkeypatch, capsys
+):
+    """The whole point of the warning: your config names a model for another
+    provider. Comparing against DEFAULTS instead of what the files resolved to
+    inverted it - this case printed nothing."""
+    _write_user_config("provider: openai" + chr(10) + "model: gpt-4o" + chr(10))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--provider", "nvidia", "--no-speak"])
+
+    cli.main()
+
+    assert "gpt-4o" in capsys.readouterr().err
+
+
+def test_restating_the_configured_provider_does_not_warn(wired, monkeypatch, capsys):
+    """Not a switch, so there is nothing to say - and saying it trains people
+    to ignore the warning that matters."""
+    _write_user_config("provider: openai" + chr(10) + "model: gpt-4o" + chr(10))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--provider", "openai", "--no-speak"])
+
+    cli.main()
+
+    assert "from your config" not in capsys.readouterr().err
+
+
+def test_an_explicit_model_never_warns(wired, monkeypatch, capsys):
+    _write_user_config("provider: openai" + chr(10) + "model: gpt-4o" + chr(10))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--provider", "nvidia",
+                                     "--model", "a/b", "--no-speak"])
+
+    cli.main()
+
+    assert "from your config" not in capsys.readouterr().err
+
+
+def test_the_warning_survives_a_config_only_a_flag_could_fix(wired, monkeypatch):
+    """Computing the pre-flag baseline must not resurrect an error the flag
+    was overriding: `provider: openia` in a file with --provider groq."""
+    _write_user_config("provider: openia" + chr(10))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--provider", "groq", "--no-speak"])
+
+    cli.main()          # must not raise
+
+
+# ---------------------------------------------------------------------------
+# --with-diff ships only the code it is summarising
+# ---------------------------------------------------------------------------
+
+def test_diff_is_rescoped_when_filtering_drops_the_newest_commit(monkeypatch):
+    """_diff_for only recomputed when the OLDEST commit moved, so the
+    both-ends scoping added to diff_for_commits was bypassed exactly when
+    noise filtering dropped HEAD - and that commit's code still shipped."""
+    original = [Commit("new", "feat: keep", "", "Al", []),
+                Commit("old", "feat: base", "", "Al", [])]
+    result = GitResult(commits=[Commit("wip", "wip: secret", "", "Al", [])] + original,
+                       used_fallback=False, tag=None, diff="+secret code")
+    rescoped = []
+    monkeypatch.setattr(cli.gitsource, "diff_for_commits",
+                        lambda commits, *a: rescoped.append(commits) or "+safe")
+
+    out = cli._diff_for(result, original, True)
+
+    assert out == "+safe"
+    assert rescoped == [original]
+
+
+def test_an_unfiltered_range_reuses_the_diff_already_computed(monkeypatch):
+    """Recomputing costs a git process; only do it when the range moved."""
+    commits = [Commit("a", "feat: one", "", "Al", []),
+               Commit("b", "feat: two", "", "Al", [])]
+    result = GitResult(commits=commits, used_fallback=False, tag=None, diff="+original")
+    monkeypatch.setattr(cli.gitsource, "diff_for_commits",
+                        lambda *a: pytest.fail("recomputed an unchanged range"))
+
+    assert cli._diff_for(result, commits, True) == "+original"
+
+
+# ---------------------------------------------------------------------------
+# Ctrl+C means stop the command; EOF means skip this one prompt
+# ---------------------------------------------------------------------------
+
+def test_ctrl_c_at_the_key_prompt_stops_the_run(wired, monkeypatch):
+    """_offer_key caught SetupAborted, which wraps Ctrl-C as well as EOF, so an
+    interrupt at the key prompt was absorbed and the run carried on through
+    commit reading, the model call, the fallback print, the voice.md write and
+    a TTS attempt. Fixing the old traceback overshot: declining to paste a key
+    is not the same answer as asking for the command to stop."""
+    monkeypatch.setattr(cli.wizard, "ensure_key",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            cli.wizard.SetupAborted(interrupted=True)))
+    monkeypatch.setattr(cli.generate, "generate",
+                        lambda *a, **k: pytest.fail("kept going after Ctrl+C"))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 130       # the conventional code for SIGINT
+
+
+def test_ctrl_d_at_the_key_prompt_still_only_skips_the_prompt(wired, monkeypatch, capsys):
+    """EOF is an answer to the question, not to the command."""
+    monkeypatch.setattr(cli.wizard, "ensure_key",
+                        lambda *a, **k: (_ for _ in ()).throw(cli.wizard.SetupAborted()))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
+
+    cli.main()
+
+    assert "## Unreleased" in capsys.readouterr().out
+
+
+def test_ctrl_c_anywhere_exits_cleanly_rather_than_tracebacking(wired, monkeypatch, capsys):
+    """A CLI should not print a traceback for Ctrl+C - including during the
+    model call, which had no handler at all."""
+    monkeypatch.setattr(cli.generate, "generate",
+                        lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 130
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_ctrl_c_during_setup_stops_rather_than_resuming(wired, monkeypatch):
+    """On a first run an aborted setup hands control back so the typed command
+    still completes. That is right for "I don't want to set up now" and wrong
+    for "stop"."""
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr(cli.wizard, "run_setup",
+                        lambda current, dest=None: (_ for _ in ()).throw(
+                            cli.wizard.SetupAborted(interrupted=True)))
+
+    with pytest.raises(KeyboardInterrupt):
+        cli._run_setup(_args(), _config(), resume=True)
+
+
+def test_flags_still_apply_when_the_config_is_unreadable(wired, monkeypatch):
+    """Both recovery paths rebuilt a Config from DEFAULTS alone, dropping the
+    flag layer with it - so `--setup --provider groq` against a broken config
+    opened the wizard preselected on NVIDIA. Flags moving inside load is what
+    made this possible; they are a layer, and the recovery needs that layer."""
+    _write_user_config("provider: [unclosed" + chr(10))
+    seen = {}
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr(cli, "_run_setup",
+                        lambda a, cfg, resume=False: seen.update(cfg=cfg))
+    monkeypatch.setattr("sys.argv",
+                        ["voicelog", "--setup", "--provider", "groq", "--no-speak"])
+
+    cli.main()
+
+    assert seen["cfg"].provider == "groq"
+    assert seen["cfg"].base_url == "https://api.groq.com/openai/v1"
+
+
+def test_flags_still_apply_when_a_value_is_unusable(wired, monkeypatch):
+    """The other recovery branch: a bad value the wizard can repair."""
+    _write_user_config("max_commits: many" + chr(10))
+    seen = {}
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr(cli, "_run_setup",
+                        lambda a, cfg, resume=False: seen.update(cfg=cfg))
+    monkeypatch.setattr("sys.argv",
+                        ["voicelog", "--setup", "--provider", "groq", "--no-speak"])
+
+    cli.main()
+
+    assert seen["cfg"].provider == "groq"
+
+
+def test_a_bad_flag_still_exits_2_when_the_config_is_also_broken(wired, monkeypatch, capsys):
+    """Handing the flag layer to the recovery path made it re-validate those
+    flags, where nothing caught the result - so an unparseable config plus a
+    typo'd --provider produced a chained traceback instead of the clean exit 2
+    the same typo gets on its own. Only reachable once flag validation moved
+    into config, which is what made the recovery path revalidate at all."""
+    _write_user_config("provider: [unclosed" + chr(10))
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr("sys.argv", ["voicelog", "--setup", "--provider", "typo"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--provider" in err and "Traceback" not in err
+
+
+def test_git_missing_says_so_rather_than_blaming_the_directory(wired, monkeypatch, capsys):
+    """gitsource grew a distinct message for "git could not be run", and both
+    handlers threw it away for a hardcoded "not a git repository" - telling
+    someone whose PATH is broken to cd somewhere else."""
+    monkeypatch.setattr(cli.gitsource, "read_commits",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            cli.NotAGitRepo("git could not be run (not found)")))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
+
+    with pytest.raises(SystemExit):
+        cli.main()
+
+    assert "git could not be run" in capsys.readouterr().err
+
+
+def test_a_real_non_repo_still_says_so(wired, monkeypatch, capsys):
+    """The ordinary case keeps its actionable message."""
+    monkeypatch.setattr(cli.gitsource, "read_commits",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            cli.NotAGitRepo("Current directory is not inside a git repository.")))
+    monkeypatch.setattr("sys.argv", ["voicelog", "--no-speak"])
+
+    with pytest.raises(SystemExit):
+        cli.main()
+
+    assert "not inside a git repository" in capsys.readouterr().err

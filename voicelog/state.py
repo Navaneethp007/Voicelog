@@ -21,7 +21,8 @@ from __future__ import annotations
 import datetime
 import json
 import os
-import subprocess
+
+from voicelog import fileio, gitsource
 
 STATE_VERSION = 1
 
@@ -41,10 +42,12 @@ def private_path(relpath: str, repo_dir: str | None = None) -> str | None:
     if repo_dir:
         args += ["-C", repo_dir]
     args += ["rev-parse", "--absolute-git-dir"]
-    try:
-        result = subprocess.run(args, capture_output=True, text=True)
-    except OSError:
-        return None  # git not installed
+    # Through gitsource's runner, not a second subprocess.run of our own: it
+    # pins UTF-8 (rev-parse echoes the repo path back, and a non-ASCII one
+    # decoded through cp1252 becomes a mojibake directory that this module then
+    # creates as junk beside the real repo) and turns a missing git into a
+    # non-zero result rather than an exception.
+    result = gitsource._run(*args)
     git_dir = result.stdout.strip()
     if result.returncode != 0 or not git_dir:
         return None  # not a git repository
@@ -105,18 +108,10 @@ def record_summarised(sha: str) -> bool:
     data = _read()
     data.update(payload)
 
-    tmp = f"{path}.tmp"
     try:
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(data, fh)
-        os.replace(tmp, path)
+        fileio.atomic_write_text(path, json.dumps(data))
     except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        # Silent: a watermark is a convenience, and the caller has already
+        # shown the user their changelog by this point.
         return False
     return True

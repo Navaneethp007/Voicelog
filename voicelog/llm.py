@@ -7,12 +7,13 @@ import httpx
 
 from voicelog import providers
 from voicelog.providers import (
+    headers as _headers,
     AUTH_REJECTED as _AUTH_REJECTED,
     MAX_PARAM_ADAPTATIONS,
     MODEL_REJECTED as _MODEL_REJECTED,
     normalize_base_url,
 )
-from voicelog.redact import redact
+from voicelog.redact import detail, redact
 
 # Which statuses mean "wrong model" lives in `providers` so the verifier and
 # the generator can never disagree about it. Everything else keeps the
@@ -74,7 +75,7 @@ def complete(messages: list[dict], config) -> str:
         ModelUnavailable:  If the provider rejects the model id (404/410).
         LLMError:          If both request attempts fail.
     """
-    model = (getattr(config, "model", "") or "").strip()
+    model = config.model.strip()
     if not model:
         raise MissingModel(
             "no model configured — voicelog ships no default model on purpose, "
@@ -85,19 +86,17 @@ def complete(messages: list[dict], config) -> str:
 
     # A blank api_key_env means the endpoint needs no key at all (a local
     # Ollama, an unauthenticated proxy) — not that we forgot to configure one.
-    env_name = getattr(config, "api_key_env", "NVIDIA_API_KEY")
+    env_name = config.api_key_env
     api_key = os.environ.get(env_name) if env_name else None
     if env_name and not api_key:
         raise MissingApiKey(
             f"Set the {env_name} environment variable with your "
-            f"{getattr(config, 'provider', 'LLM')} API key."
+            f"{config.provider} API key."
         )
 
     base_url = normalize_base_url(config.base_url)
     url = f"{base_url}/chat/completions"
-    headers = {"Accept": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    headers = _headers(api_key)
     payload = {
         "model": model,
         "messages": messages,
@@ -105,7 +104,7 @@ def complete(messages: list[dict], config) -> str:
         "max_tokens": 4096,
     }
 
-    timeout = getattr(config, "llm_timeout", 120.0)
+    timeout = config.llm_timeout
 
     last_exc: Exception | None = None
     attempts_left = 2  # try once, retry once on failure
@@ -134,7 +133,7 @@ def complete(messages: list[dict], config) -> str:
                 # second attempt, and the fix is a new key, not a wait.
                 raise InvalidApiKey(
                     f"{env_name or 'the API key'} was rejected by "
-                    f"{getattr(config, 'provider', 'the provider')} "
+                    f"{config.provider} "
                     f"(HTTP {response.status_code}) - the key may have expired, "
                     f"been revoked, or belong to a different provider. "
                     f"Set a new one, or run `voicelog --setup`."
@@ -144,7 +143,7 @@ def complete(messages: list[dict], config) -> str:
                 # second attempt, and the fix is a config change, not a wait.
                 raise ModelUnavailable(
                     f"model '{model}' was rejected by "
-                    f"{getattr(config, 'provider', 'the provider')} "
+                    f"{config.provider} "
                     f"(HTTP {response.status_code}) — it may have been renamed or "
                     f"retired, or {base_url} may be the wrong endpoint. "
                     f"Run `voicelog --setup` to pick a current model, "
@@ -153,9 +152,13 @@ def complete(messages: list[dict], config) -> str:
             if not response.is_success:
                 last_exc = Exception(
                     f"HTTP {response.status_code}: "
-                    # Redact first: truncating first would cut a key in half and
-                    # leave a prefix that replace() can no longer match.
-                    f"{redact(response.text, api_key)[:_MAX_BODY_CHARS]}"
+                    # Redact here, bound at the raise below - one truncation, at
+                    # the point the message is emitted. Doing both here meant the
+                    # finished message was truncated a second time, to the
+                    # smaller default, discarding a third of the body this
+                    # budget exists to keep. Redaction still comes first, so a
+                    # key can never be cut in half and survive as a prefix.
+                    f"{redact(response.text, api_key)}"
                 )
                 attempts_left -= 1
                 continue
@@ -176,4 +179,4 @@ def complete(messages: list[dict], config) -> str:
             last_exc = exc
         attempts_left -= 1
 
-    raise LLMError(redact(str(last_exc), api_key))
+    raise LLMError(detail(str(last_exc), api_key, limit=_MAX_BODY_CHARS))

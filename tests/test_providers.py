@@ -427,3 +427,78 @@ def test_fetch_models_survives_a_unicode_error():
     with mock.patch("voicelog.providers.httpx.get", side_effect=UnicodeError("bad host")):
         with pytest.raises(ProviderError):
             providers.fetch_models("https://x/v1", "k")
+
+
+def test_fetch_models_never_echoes_the_key_in_its_error():
+    """verify_model redacts the identical case. httpx puts the request URL in
+    several exception messages, and a key pasted into a base_url - or echoed by
+    a proxy - would otherwise land in a terminal and a bug report."""
+    key = "nvapi-supersecret-value"
+    with mock.patch("voicelog.providers.httpx.get",
+                    side_effect=httpx.ConnectError(f"failed for {key}")):
+        with pytest.raises(ProviderError) as exc:
+            providers.fetch_models("https://x/v1", key)
+
+    assert key not in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# One table: the registry is the only place a provider fact is written
+# ---------------------------------------------------------------------------
+
+def test_every_speech_backend_has_an_adapter():
+    """_ADAPTERS was a second registry that could drift from TTS_PROVIDERS, and
+    had: `none` is a first-class TTS_PROVIDERS entry with no adapter, so
+    tts_provider: none reached speak() and was called "unknown"."""
+    from voicelog import tts
+    assert set(tts._ADAPTERS) | {providers.NO_TTS_KEY} == set(providers.TTS_PROVIDERS)
+
+
+def test_no_adapter_exists_for_a_backend_not_in_the_registry():
+    from voicelog import tts
+    assert set(tts._ADAPTERS) <= set(providers.TTS_PROVIDERS)
+
+
+def test_the_defaults_table_does_not_restate_the_presets():
+    """DEFAULTS spelled NVIDIA's URL, key env var and Magpie voice as literals,
+    so the registry and the defaults could disagree with nothing to catch it."""
+    from voicelog.config import DEFAULTS
+    nvidia = providers.PROVIDERS["nvidia"]
+    riva = providers.TTS_PROVIDERS["riva"]
+
+    assert DEFAULTS["provider"] == nvidia.key
+    assert DEFAULTS["base_url"] == nvidia.base_url
+    assert DEFAULTS["api_key_env"] == nvidia.api_key_env
+    assert DEFAULTS["tts_provider"] == riva.key
+    assert DEFAULTS["tts_api_key_env"] == riva.api_key_env
+    assert DEFAULTS["tts_voice"] == riva.voices[0]
+    assert DEFAULTS["tts_function_id"] == riva.function_id
+    assert DEFAULTS["tts_language"] == riva.language
+    assert DEFAULTS["tts_sample_rate"] == riva.sample_rate
+
+
+def test_speech_presets_carry_their_own_endpoint_and_model():
+    """These lived in tts.py as `or "gpt-4o-mini-tts"` fallbacks - a shadow
+    default table for keys DEFAULTS deliberately leaves blank."""
+    assert providers.TTS_PROVIDERS["openai"].base_url == "https://api.openai.com/v1"
+    assert providers.TTS_PROVIDERS["openai"].model == "gpt-4o-mini-tts"
+    assert providers.TTS_PROVIDERS["openai"].sample_rate == 24000
+    assert providers.TTS_PROVIDERS["elevenlabs"].model == "eleven_multilingual_v2"
+    assert providers.TTS_PROVIDERS["elevenlabs"].sample_rate == 24000
+
+
+def test_the_llm_to_tts_affinity_is_derived_not_typed():
+    """_LLM_TO_TTS was a third hand-written table; it is exactly "the backends
+    that share a key variable with a text provider"."""
+    from voicelog import wizard
+    for llm_key, tts_key in wizard._LLM_TO_TTS.items():
+        assert providers.PROVIDERS[llm_key].api_key_env == (
+            providers.TTS_PROVIDERS[tts_key].api_key_env
+        )
+
+
+def test_llm_and_providers_build_the_same_headers():
+    """llm.py re-implemented providers._headers byte for byte, while already
+    importing four constants from that module to stop exactly this drift."""
+    from voicelog import llm
+    assert llm._headers is providers.headers

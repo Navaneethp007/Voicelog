@@ -1,6 +1,7 @@
 """Read commits from the current git repository."""
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
 
@@ -9,10 +10,6 @@ from voicelog.models import Commit
 
 class NotAGitRepo(Exception):
     """Raised when the current directory is not inside a git work-tree."""
-
-
-class NoCommitsFound(Exception):
-    """Raised when the commit range yields no commits (reserved for future use)."""
 
 
 class RefNotFound(Exception):
@@ -35,8 +32,82 @@ _EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 _MAX_DIFF_CHARS = 20_000
 
 
+# What _run reports when git could not be launched at all, rather than running
+# and refusing. 127 is the shell convention for "command not found".
+_GIT_MISSING_RC = 127
+
+
 def _run(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(args, capture_output=True, text=True)
+    """Run one git command. The single git boundary for this package.
+
+    Two things are pinned here rather than at each of the twelve call sites:
+
+    - **UTF-8, not the locale codepage.** git emits UTF-8; ``text=True`` alone
+      decodes with ``locale.getpreferredencoding()``, which is cp1252 on a
+      default Windows box. A Cyrillic commit subject came back as mojibake and
+      went on into the prompt, the changelog and the cache key; a byte that
+      codepage does not define could end the run outright. ``errors="replace"``
+      makes an undecodable byte a mangled character instead of a dead run -
+      git itself permits a non-UTF-8 commit message, so this is reachable.
+    - **OSError is a result, not an exception.** With git off PATH this raised a
+      bare FileNotFoundError from whichever caller ran first, while
+      ``state.private_path`` guarded the identical call. Returning a 127 result
+      routes it to the same NotAGitRepo path every caller already handles.
+    """
+    try:
+        return subprocess.run(
+            args, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess(
+            args, _GIT_MISSING_RC, "", f"git could not be run ({exc})"
+        )
+
+
+def _not_a_repo(result: subprocess.CompletedProcess) -> NotAGitRepo:
+    """The right NotAGitRepo for a failed work-tree check.
+
+    "git is not installed" and "this is not a repository" have the same handler
+    but must not have the same message - the first one's fix is not `cd`.
+    """
+    if result.returncode == _GIT_MISSING_RC:
+        return NotAGitRepo(result.stderr.strip() or "git could not be run.")
+    return NotAGitRepo(
+        "not a git repository (run voicelog from inside a git repo)"
+    )
+
+
+def _as_count(value: str) -> int:
+    """A numstat count, or 0 when git did not print a number.
+
+    Binary files report "-" by design; anything else non-numeric is git
+    output we did not anticipate, and a changelog is not worth a crash
+    over a diffstat.
+    """
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
+# A rename with a common prefix, as --numstat spells it: "dir/{old => new}".
+_RENAME_RE = re.compile(r"\{([^{}]*) => ([^{}]*)\}")
+
+
+def _rename_target(path: str) -> str:
+    """The post-rename path for something git may have written as a rename.
+
+    --numstat encodes a rename inline, where --name-only (which it replaced)
+    gave a plain path. Left alone, "src/{old.py => new.py}" reached the prompt
+    as a filename that never existed.
+
+    Two spellings, because git only uses braces when the paths share a prefix:
+    "dir/{old.txt => new.txt}" and, for an unrelated move, "old.txt => new.txt".
+    """
+    if "{" in path:
+        return _RENAME_RE.sub(lambda m: m.group(2), path)
+    before, sep, after = path.partition(" => ")
+    return after if sep else path
 
 
 def _parse_numstat_block(files_raw: str) -> tuple[list[str], int, int]:
@@ -55,11 +126,11 @@ def _parse_numstat_block(files_raw: str) -> tuple[list[str], int, int]:
         if len(parts) != 3:
             continue  # unexpected git output — skip rather than crash
         ins, del_, path = parts
-        files.append(path)
-        if ins != "-":
-            insertions += int(ins)
-        if del_ != "-":
-            deletions += int(del_)
+        files.append(_rename_target(path))
+        # Binary files report "-", and an unreadable count is not worth a crash
+        # in the middle of a changelog, so anything non-numeric contributes 0.
+        insertions += _as_count(ins)
+        deletions += _as_count(del_)
     return files, insertions, deletions
 
 
@@ -114,7 +185,7 @@ def read_recent_commits(n: int = 15, with_diff: bool = False) -> GitResult:
     """
     check = _run("git", "rev-parse", "--is-inside-work-tree")
     if check.returncode != 0:
-        raise NotAGitRepo("Current directory is not inside a git repository.")
+        raise _not_a_repo(check)
 
     log_result = _run("git", "log", f"-n{n}", _PRETTY, "--numstat")
     output = log_result.stdout
@@ -174,7 +245,11 @@ def detect_base_branch() -> str | None:
     return None
 
 
-def _get_diff(oldest_commit_hash: str, max_chars: int = _MAX_DIFF_CHARS) -> str:
+def _get_diff(
+    oldest_commit_hash: str,
+    max_chars: int = _MAX_DIFF_CHARS,
+    newest_commit_hash: str = "HEAD",
+) -> str:
     """Aggregate unified diff for everything after ``oldest_commit_hash``'s parent.
 
     Diffs against the actual oldest commit IN THE PARSED RANGE (not an assumed
@@ -186,7 +261,7 @@ def _get_diff(oldest_commit_hash: str, max_chars: int = _MAX_DIFF_CHARS) -> str:
     has_parent = _run("git", "rev-parse", "--verify", "--quiet", f"{oldest_commit_hash}^")
     base = f"{oldest_commit_hash}^" if has_parent.returncode == 0 else _EMPTY_TREE_SHA
 
-    diff_result = _run("git", "diff", f"{base}..HEAD")
+    diff_result = _run("git", "diff", f"{base}..{newest_commit_hash}")
     diff = diff_result.stdout
     if len(diff) > max_chars:
         diff = diff[:max_chars] + "\n\n... (diff truncated)"
@@ -206,7 +281,11 @@ def diff_for_commits(commits: list[Commit], max_chars: int = _MAX_DIFF_CHARS) ->
     """
     if not commits:
         return None
-    return _get_diff(commits[-1].hash, max_chars)
+    # Both ends, not just the oldest. Scoping only the oldest end left the range
+    # running to HEAD, so a noise-filtered newest commit was dropped from the
+    # prompt and the cache key while its code still went to the provider -
+    # against this function's own promise and the opt-in framing of --with-diff.
+    return _get_diff(commits[-1].hash, max_chars, commits[0].hash)
 
 
 def read_commits(
@@ -226,7 +305,7 @@ def read_commits(
     # 1. Verify we're inside a git work-tree.
     check = _run("git", "rev-parse", "--is-inside-work-tree")
     if check.returncode != 0:
-        raise NotAGitRepo("Current directory is not inside a git repository.")
+        raise _not_a_repo(check)
 
     if since is not None:
         # 2a. Explicit range: <since>..HEAD. Validate the ref first.

@@ -24,3 +24,20 @@ def redact(text: str, *secrets: str | None) -> str:
         if secret:
             text = text.replace(secret, "***")
     return text
+
+
+# What a provider's error body is worth quoting. Long enough to carry a real
+# message, short enough not to paste an HTML login page into a terminal.
+DEFAULT_LIMIT = 200
+
+
+def detail(text: str, *secrets: str | None, limit: int = DEFAULT_LIMIT) -> str:
+    """A provider's message, safe to print: redacted, then truncated.
+
+    Both steps, in this order, in one place. Four call sites did them by hand
+    with three different limits and three copies of the comment explaining why
+    the order matters - which is three chances to get it wrong, and the
+    truncate-first bug had already happened once.
+    """
+    out = redact(text, *secrets)
+    return out if len(out) <= limit else out[:limit] + "..."

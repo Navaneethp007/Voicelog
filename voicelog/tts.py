@@ -14,10 +14,13 @@ import subprocess
 import tempfile
 import time
 import wave
+from urllib.parse import quote
 
 import httpx
 
-from voicelog.redact import redact
+from voicelog import providers
+from voicelog.providers import normalize_base_url
+from voicelog.redact import detail
 
 
 class TTSError(Exception):
@@ -54,13 +57,14 @@ def _check_playback() -> None:
             )
 
 
-# How long to wait between checks while asynchronous playback runs. Short
-# enough that Ctrl+C feels immediate, long enough not to spin the CPU.
+# How long to wait between checks while playback runs. Short enough that Ctrl+C
+# feels immediate, long enough not to spin the CPU.
 _PLAY_POLL_SECONDS = 0.1
 
-# Audio may still be draining when the computed duration elapses; this much
-# grace keeps the last syllable from being cut by the temp file's deletion.
-_PLAY_GRACE_SECONDS = 0.25
+# Slack added to the known duration before we consider playback finished.
+# PlaySound tells us when a sound is *queued*, never when it is audible, and a
+# Bluetooth device can take a noticeable moment to start.
+_PLAY_GRACE_SECONDS = 1.0
 
 
 def _import_winsound():
@@ -70,62 +74,65 @@ def _import_winsound():
     return winsound
 
 
-def _wav_seconds(path: str) -> float:
-    """How long a WAV runs for, or 0.0 when that cannot be determined."""
-    try:
-        with wave.open(path, "rb") as wav:
-            rate = wav.getframerate()
-            return wav.getnframes() / rate if rate else 0.0
-    except (OSError, wave.Error, EOFError):
-        # EOFError is what a truncated file raises, and it is not an OSError.
-        return 0.0
+def _play_windows(path: str, seconds: float) -> None:
+    """Play a WAV on Windows, interruptibly. ``seconds`` is its known duration.
 
+    A synchronous PlaySound is a blocking call into the OS, and Python can only
+    deliver KeyboardInterrupt between bytecode instructions - so it queued the
+    user's Ctrl+C until the audio had finished, while the CLI printed
+    "Ctrl+C to skip" before every utterance. Playing asynchronously and waiting
+    in slices puts the interrupt back within reach, and SND_PURGE stops sound
+    that is already playing.
 
-def _play_windows(path: str) -> None:
-    """Play a WAV on Windows, interruptibly.
+    **The sound must be started on this thread.** Handing PlaySound to a worker
+    thread and joining it looks tidier - the thread returning would *be* the
+    completion signal, with no duration to know - but SND_PURGE only acts on
+    the thread that started the sound. Measured: purging another thread's sound
+    blocks for the remainder of the audio (9.44s of a 10s file) instead of
+    stopping it, so Ctrl+C became a no-op that merely waited. From this thread
+    the same call returns in 0.01s and actually stops.
 
-    PlaySound is a blocking call into the OS, and Python can only deliver
-    KeyboardInterrupt between bytecode instructions - so a synchronous play
-    queued the user's Ctrl+C until the audio had finished on its own, and the
-    handler then reported "skipped audio" for something fully played. The CLI
-    prints "Ctrl+C to skip" before every utterance, so that was a promise the
-    code did not keep.
-
-    Playing asynchronously and waiting in slices puts the interrupt back within
-    reach; SND_PURGE stops sound that is already playing, which is what makes it
-    a skip rather than a delayed acknowledgement. POSIX needs none of this: Ctrl+C
-    reaches the whole process group, so afplay/aplay are signalled directly.
+    The duration is passed in rather than read back from the header: speak()
+    wrote the PCM and knows it exactly. Re-reading meant a file whose header we
+    could not parse fell through to a synchronous play - reinstating the very
+    bug this exists to fix.
     """
     winsound = _import_winsound()
-    seconds = _wav_seconds(path)
-    if not seconds:
-        # No duration to wait out. A plain synchronous play is still better than
-        # not playing at all - it just cannot be interrupted.
-        winsound.PlaySound(path, winsound.SND_FILENAME)
-        return
-
-    deadline = time.monotonic() + seconds + _PLAY_GRACE_SECONDS
     try:
-        # Inside the try: an interrupt arriving between starting the sound
-        # and reaching the loop would otherwise escape the purge, leaving
-        # audio playing under a 'skipped audio' message and a temp WAV that
-        # speak() cannot delete while it is still open.
+        # Inside the try: an interrupt arriving between starting the sound and
+        # reaching the loop would otherwise escape the purge, leaving audio
+        # playing under a 'skipped audio' message and a temp WAV that speak()
+        # cannot delete while it is still open.
         winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        # Timed from after the call, not before: whatever was spent queueing
+        # the sound would otherwise count against the audio's own length.
+        deadline = time.monotonic() + seconds + _PLAY_GRACE_SECONDS
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
             time.sleep(min(_PLAY_POLL_SECONDS, remaining))
     except KeyboardInterrupt:
-        winsound.PlaySound(None, winsound.SND_PURGE)
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:  # noqa: BLE001
+            # A failing purge must not replace the interrupt: raising here would
+            # discard the KeyboardInterrupt and cli._speak would never print
+            # "skipped audio". The worst case is audio that plays on, which is
+            # exactly where we started.
+            pass
         raise
 
 
-def _play(path: str) -> None:
-    """Play a WAV file synchronously on the current OS. Patchable in tests."""
+def _play(path: str, seconds: float = 0.0) -> None:
+    """Play a WAV file on the current OS, blocking until it ends.
+
+    ``seconds`` is the audio's known duration; only Windows needs it, because
+    only there do we have to decide for ourselves when playback is over.
+    """
     system = platform.system()
     if system == "Windows":
-        _play_windows(path)
+        _play_windows(path, seconds)
         return
     if system == "Darwin":
         subprocess.run(["afplay", path], check=True)
@@ -221,11 +228,11 @@ def _synth_riva(chunks: list[str], api_key: str, config) -> tuple[bytes, int]:
 
     import grpc  # present whenever riva.client imported
 
-    timeout = getattr(config, "tts_timeout", 90.0)
+    timeout = config.tts_timeout
     rate = config.tts_sample_rate
     try:
         auth = riva_client.Auth(
-            uri="grpc.nvcf.nvidia.com:443",
+            uri=providers.TTS_PROVIDERS["riva"].base_url,
             use_ssl=True,
             metadata_args=[
                 ["function-id", config.tts_function_id],
@@ -261,18 +268,27 @@ def _synth_riva(chunks: list[str], api_key: str, config) -> tuple[bytes, int]:
     except Exception as exc:
         # Broad by design, and it wraps the Auth construction that is handed the
         # key - so scrub before the message escapes.
-        raise TTSError(redact(str(exc), api_key)) from exc
+        raise TTSError(detail(str(exc), api_key)) from exc
 
     return bytes(pcm), rate
 
 
 def _synth_openai(chunks: list[str], api_key: str, config) -> tuple[bytes, int]:
-    base = (getattr(config, "tts_base_url", "") or "https://api.openai.com/v1").rstrip("/")
-    model = getattr(config, "tts_model", "") or "gpt-4o-mini-tts"
-    voice = config.tts_voice or "alloy"
-    timeout = getattr(config, "tts_timeout", 90.0)
+    # Defaults come from the preset, not from literals here: these are facts
+    # about the backend, and a second copy of them in this module is how "the
+    # default speech model" ended up with no single home.
+    preset = providers.TTS_PROVIDERS["openai"]
+    base = normalize_base_url(config.tts_base_url or preset.base_url)
+    model = config.tts_model or preset.model
+    voice = config.tts_voice or preset.voices[0]
+    timeout = config.tts_timeout
     url = f"{base}/audio/speech"
-    headers = {"Authorization": f"Bearer {api_key}"}
+    # Omitted entirely when there is no key, rather than sent empty: a blank
+    # tts_api_key_env means the endpoint needs none, and "Authorization: Bearer "
+    # is a malformed header a local server may reject outright. Not
+    # providers.headers(), which also sets Accept: application/json - correct
+    # for the JSON APIs it serves, wrong to start sending to an audio endpoint.
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
     pcm = bytearray()
     for chunk in chunks:
@@ -288,7 +304,7 @@ def _synth_openai(chunks: list[str], api_key: str, config) -> tuple[bytes, int]:
                 # prefix that no later replace() can match.
                 raise TTSError(
                     f"OpenAI TTS HTTP {resp.status_code}: "
-                    f"{redact(resp.text, api_key)[:200]}"
+                    f"{detail(resp.text, api_key)}"
                 )
             pcm.extend(resp.content)
         except TTSError:
@@ -297,17 +313,22 @@ def _synth_openai(chunks: list[str], api_key: str, config) -> tuple[bytes, int]:
             raise TTSError(f"OpenAI TTS request failed: {exc}") from exc
 
     # OpenAI 'pcm' is 24 kHz, 16-bit, mono.
-    return bytes(pcm), 24000
+    return bytes(pcm), preset.sample_rate
 
 
 def _synth_elevenlabs(chunks: list[str], api_key: str, config) -> tuple[bytes, int]:
     voice_id = config.tts_voice
     if not voice_id:
         raise TTSError("ElevenLabs needs tts_voice set to a voice id")
-    model = getattr(config, "tts_model", "") or "eleven_multilingual_v2"
-    timeout = getattr(config, "tts_timeout", 90.0)
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=pcm_24000"
-    headers = {"xi-api-key": api_key}
+    preset = providers.TTS_PROVIDERS["elevenlabs"]
+    model = config.tts_model or preset.model
+    timeout = config.tts_timeout
+    base = normalize_base_url(config.tts_base_url or preset.base_url)
+    url = (
+        f"{base}/text-to-speech/{quote(voice_id, safe='')}"
+        f"?output_format=pcm_{preset.sample_rate}"
+    )
+    headers = {"xi-api-key": api_key} if api_key else {}
 
     pcm = bytearray()
     for chunk in chunks:
@@ -321,7 +342,7 @@ def _synth_elevenlabs(chunks: list[str], api_key: str, config) -> tuple[bytes, i
             if not resp.is_success:
                 raise TTSError(
                     f"ElevenLabs HTTP {resp.status_code}: "
-                    f"{redact(resp.text, api_key)[:200]}"
+                    f"{detail(resp.text, api_key)}"
                 )
             pcm.extend(resp.content)
         except TTSError:
@@ -329,7 +350,7 @@ def _synth_elevenlabs(chunks: list[str], api_key: str, config) -> tuple[bytes, i
         except httpx.HTTPError as exc:
             raise TTSError(f"ElevenLabs request failed: {exc}") from exc
 
-    return bytes(pcm), 24000
+    return bytes(pcm), preset.sample_rate
 
 
 _ADAPTERS = {
@@ -358,20 +379,27 @@ def speak(text: str, config) -> None:
     if not chunks:
         return
 
-    provider = getattr(config, "tts_provider", "riva").lower()
+    provider = config.tts_provider.lower()
     adapter = _ADAPTERS.get(provider)
     if adapter is None:
+        # The list comes from the registry, so it can name every value the
+        # wizard and --help offer. Built from _ADAPTERS it could not even
+        # mention `none`, which is a legitimate answer it has no adapter for.
         raise TTSError(
             f"unknown tts_provider '{provider}' — use one of: "
-            f"{', '.join(sorted(_ADAPTERS))}"
+            f"{', '.join(sorted(providers.TTS_PROVIDERS))}"
         )
 
     # Fail before spending an API call if we can't play audio here.
     _check_playback()
 
-    env_name = getattr(config, "tts_api_key_env", "NVIDIA_API_KEY")
-    api_key = os.environ.get(env_name)
-    if not api_key:
+    # A blank name means the endpoint needs no key - a local OpenAI-compatible
+    # server, say. llm.complete has always read it that way; this did not, and
+    # raised "Set the  environment variable" with an empty name. The wizard can
+    # produce a blank value, so it was reachable.
+    env_name = config.tts_api_key_env
+    api_key = os.environ.get(env_name, "") if env_name else ""
+    if env_name and not api_key:
         raise TTSError(
             f"Set the {env_name} environment variable with your {provider} TTS key."
         )
@@ -389,10 +417,25 @@ def speak(text: str, config) -> None:
             wav.setsampwidth(2)  # 16-bit PCM
             wav.setframerate(rate)
             wav.writeframes(pcm)
-        _play(path)
-    except (OSError, subprocess.CalledProcessError) as exc:
+        # 16-bit mono, so two bytes per frame. speak() wrote it, so this is
+        # exact - no header to re-read and no unparseable case to fall back
+        # from.
+        _play(path, len(pcm) / 2 / rate if rate else 0.0)
+    except (
+        OSError,
+        subprocess.CalledProcessError,   # POSIX players, run with check=True
+        RuntimeError,                    # winsound.PlaySound: "Failed to play sound"
+        ImportError,                     # a Windows build without winsound
+        wave.Error,                      # e.g. setframerate() on a non-positive rate
+    ) as exc:
         # Playback failure (busy/absent audio device, player vanished, etc.) —
         # never let this crash the CLI; the text output already succeeded.
+        #
+        # The tuple used to be OSError + CalledProcessError, which is shaped for
+        # the POSIX branch and covers almost nothing the Windows branch raises:
+        # none of RuntimeError, ImportError or wave.Error is an OSError, so each
+        # escaped here, escaped cli._speak's `except TTSError`, and tracebacked
+        # out of main() after the changelog had printed and been paid for.
         raise TTSError(f"audio playback failed: {exc}") from exc
     finally:
         try:

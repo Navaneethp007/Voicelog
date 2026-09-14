@@ -1,12 +1,15 @@
 """Tests for voicelog.tts — all mocked, no real gRPC, no real audio."""
 from __future__ import annotations
 
+import dataclasses
 import sys
+import threading
 import types
 from unittest import mock
 
 import pytest
 
+from voicelog import config as config_module
 from voicelog import tts
 from voicelog.tts import TTSError, _chunk_text, _speech_text
 
@@ -96,13 +99,48 @@ def test_chunk_text_drops_empty_chunks():
 # speak() — mocked
 # ---------------------------------------------------------------------------
 
-class FakeConfig:
-    tts_function_id = "fid-123"
-    tts_voice = "Some.Voice"
-    tts_language = "en-US"
-    tts_sample_rate = 44100
-    tts_timeout = 90.0
-    tts_api_key_env = "NVIDIA_API_KEY"
+def FakeConfig(**overrides):
+    """A real Config, not a stand-in that omits most of it.
+
+    This was a plain class carrying six attributes and omitting eighteen, which
+    is what kept fourteen `getattr(config, "x", default)` guards alive in
+    production: they were unreachable on every real path and only looked
+    necessary because of this double. Building from defaults_config() means the
+    fakes track the schema - add a field and these tests get it for free.
+    """
+    fields = dict(
+        tts_function_id="fid-123",
+        tts_voice="Some.Voice",
+        tts_language="en-US",
+        tts_sample_rate=44100,
+        tts_timeout=90.0,
+        tts_api_key_env="NVIDIA_API_KEY",
+    )
+    fields.update(overrides)
+    return dataclasses.replace(config_module.defaults_config(), **fields)
+
+
+def OpenAIConfig(**overrides):
+    fields = dict(
+        tts_provider="openai",
+        tts_model="gpt-4o-mini-tts",
+        tts_base_url="",
+        tts_voice="alloy",
+        tts_api_key_env="OPENAI_API_KEY",
+    )
+    fields.update(overrides)
+    return FakeConfig(**fields)
+
+
+def ElevenLabsConfig(**overrides):
+    fields = dict(
+        tts_provider="elevenlabs",
+        tts_model="eleven_multilingual_v2",
+        tts_voice="voice-id-123",
+        tts_api_key_env="ELEVENLABS_API_KEY",
+    )
+    fields.update(overrides)
+    return FakeConfig(**fields)
 
 
 def _make_fake_riva():
@@ -136,14 +174,11 @@ def test_speak_reads_configured_key_env(monkeypatch):
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
     monkeypatch.setenv("RIVA_KEY", "riva-abc")
 
-    class Cfg(FakeConfig):
-        tts_api_key_env = "RIVA_KEY"
-
     fake_riva, fake_encoding, service = _make_fake_riva()
     monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
-    monkeypatch.setattr(tts, "_play", lambda path: None)
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
 
-    tts.speak("Hello there.", Cfg())
+    tts.speak("Hello there.", FakeConfig(tts_api_key_env="RIVA_KEY"))
 
     # The configured key reached the auth metadata as a Bearer token.
     _, auth_kwargs = fake_riva.Auth.call_args
@@ -158,7 +193,7 @@ def test_speak_import_failure_raises_with_hint(monkeypatch):
         raise ImportError("no riva")
 
     monkeypatch.setattr(tts, "_import_riva", boom)
-    monkeypatch.setattr(tts, "_play", lambda path: None)
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
     with pytest.raises(TTSError) as exc:
         tts.speak("Hello world", FakeConfig())
     assert "pip install voicelog[tts]" in str(exc.value)
@@ -168,7 +203,7 @@ def test_speak_empty_speech_returns_without_synthesizing(monkeypatch):
     monkeypatch.setenv("NVIDIA_API_KEY", "key")
     fake_riva, fake_encoding, service = _make_fake_riva()
     monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
-    monkeypatch.setattr(tts, "_play", lambda path: None)
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
 
     result = tts.speak("```\ncode only\n```", FakeConfig())
     assert result is None
@@ -180,7 +215,7 @@ def test_speak_happy_path(monkeypatch):
     fake_riva, fake_encoding, service = _make_fake_riva()
     monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
     played = []
-    monkeypatch.setattr(tts, "_play", lambda path: played.append(path))
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: played.append(path))
 
     cfg = FakeConfig()
     tts.speak("Hello there.", cfg)
@@ -207,7 +242,7 @@ def test_speak_playback_failure_raises_ttserror(monkeypatch):
     fake_riva, fake_encoding, service = _make_fake_riva()
     monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
 
-    def boom(path):
+    def boom(path, seconds=0.0):
         raise subprocess.CalledProcessError(1, ["afplay", path])
 
     monkeypatch.setattr(tts, "_play", boom)
@@ -223,7 +258,7 @@ def test_speak_playback_missing_player_raises_ttserror(monkeypatch):
     fake_riva, fake_encoding, service = _make_fake_riva()
     monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
 
-    def boom(path):
+    def boom(path, seconds=0.0):
         raise FileNotFoundError("afplay: not found")
 
     monkeypatch.setattr(tts, "_play", boom)
@@ -237,7 +272,7 @@ def test_speak_synthesize_exception_raises(monkeypatch):
     fake_riva, fake_encoding, service = _make_fake_riva()
     service.synthesize.side_effect = RuntimeError("grpc boom")
     monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
-    monkeypatch.setattr(tts, "_play", lambda path: None)
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
 
     with pytest.raises(TTSError) as exc:
         tts.speak("Hello there.", FakeConfig())
@@ -252,7 +287,7 @@ def test_speak_timeout_raises_clean_error(monkeypatch):
     fake_riva, fake_encoding, service = _make_fake_riva()
     service.synthesize.return_value.result.side_effect = grpc.FutureTimeoutError()
     monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
-    monkeypatch.setattr(tts, "_play", lambda path: None)
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
 
     with pytest.raises(TTSError) as exc:
         tts.speak("Hello there.", FakeConfig())
@@ -265,29 +300,11 @@ def test_speak_timeout_raises_clean_error(monkeypatch):
 # Provider dispatch — unknown provider, provider-specific key errors
 # ---------------------------------------------------------------------------
 
-class OpenAIConfig(FakeConfig):
-    tts_provider = "openai"
-    tts_model = "gpt-4o-mini-tts"
-    tts_base_url = ""
-    tts_voice = "alloy"
-    tts_api_key_env = "OPENAI_API_KEY"
-
-
-class ElevenLabsConfig(FakeConfig):
-    tts_provider = "elevenlabs"
-    tts_model = "eleven_multilingual_v2"
-    tts_voice = "voice-id-123"
-    tts_api_key_env = "ELEVENLABS_API_KEY"
-
-
 def test_unknown_provider_raises_before_any_network_call(monkeypatch):
     monkeypatch.setenv("NVIDIA_API_KEY", "key")
 
-    class BadConfig(FakeConfig):
-        tts_provider = "not-a-real-provider"
-
     with pytest.raises(TTSError) as exc:
-        tts.speak("Hello there.", BadConfig())
+        tts.speak("Hello there.", FakeConfig(tts_provider="not-a-real-provider"))
     assert "not-a-real-provider" in str(exc.value)
 
 
@@ -301,7 +318,7 @@ def test_openai_missing_key_names_configured_env(monkeypatch):
 def test_openai_happy_path_posts_and_plays(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     played = []
-    monkeypatch.setattr(tts, "_play", lambda path: played.append(path))
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: played.append(path))
 
     mock_resp = mock.MagicMock()
     mock_resp.is_success = True
@@ -323,17 +340,15 @@ def test_openai_happy_path_posts_and_plays(monkeypatch):
 
 def test_openai_custom_base_url_is_used(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    monkeypatch.setattr(tts, "_play", lambda path: None)
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
 
-    class CustomConfig(OpenAIConfig):
-        tts_base_url = "https://my-proxy.example.com/v1"
 
     mock_resp = mock.MagicMock()
     mock_resp.is_success = True
     mock_resp.content = b"\x01\x02"
 
     with mock.patch("voicelog.tts.httpx.post", return_value=mock_resp) as mock_post:
-        tts.speak("Hi", CustomConfig())
+        tts.speak("Hi", OpenAIConfig(tts_base_url="https://my-proxy.example.com/v1"))
 
     call_args, _ = mock_post.call_args
     assert call_args[0] == "https://my-proxy.example.com/v1/audio/speech"
@@ -341,7 +356,7 @@ def test_openai_custom_base_url_is_used(monkeypatch):
 
 def test_openai_http_failure_raises_ttserror(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    monkeypatch.setattr(tts, "_play", lambda path: None)
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
 
     mock_resp = mock.MagicMock()
     mock_resp.is_success = False
@@ -364,7 +379,7 @@ def test_elevenlabs_missing_key_names_configured_env(monkeypatch):
 def test_elevenlabs_happy_path_posts_and_plays(monkeypatch):
     monkeypatch.setenv("ELEVENLABS_API_KEY", "el-test")
     played = []
-    monkeypatch.setattr(tts, "_play", lambda path: played.append(path))
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: played.append(path))
 
     mock_resp = mock.MagicMock()
     mock_resp.is_success = True
@@ -384,11 +399,8 @@ def test_elevenlabs_happy_path_posts_and_plays(monkeypatch):
 def test_elevenlabs_missing_voice_id_raises(monkeypatch):
     monkeypatch.setenv("ELEVENLABS_API_KEY", "el-test")
 
-    class NoVoiceConfig(ElevenLabsConfig):
-        tts_voice = ""
-
     with pytest.raises(TTSError) as exc:
-        tts.speak("Hello there.", NoVoiceConfig())
+        tts.speak("Hello there.", ElevenLabsConfig(tts_voice=""))
     assert "tts_voice" in str(exc.value)
 
 
@@ -401,7 +413,7 @@ def test_openai_error_does_not_echo_the_key(monkeypatch):
     proxy that quotes the request - headers included - back at us."""
     key = "sk-0123456789abcdefghij"
     monkeypatch.setenv("OPENAI_API_KEY", key)
-    monkeypatch.setattr(tts, "_play", lambda path: None)
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
 
     mock_resp = mock.MagicMock()
     mock_resp.is_success = False
@@ -420,7 +432,7 @@ def test_openai_error_redacts_before_truncating(monkeypatch):
     """The body is cut to 200 chars; cutting first would strand a key prefix."""
     key = "sk-0123456789abcdefghij"
     monkeypatch.setenv("OPENAI_API_KEY", key)
-    monkeypatch.setattr(tts, "_play", lambda path: None)
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
 
     mock_resp = mock.MagicMock()
     mock_resp.is_success = False
@@ -439,7 +451,7 @@ def test_openai_error_redacts_before_truncating(monkeypatch):
 def test_elevenlabs_error_does_not_echo_the_key(monkeypatch):
     key = "el-0123456789abcdefghij"
     monkeypatch.setenv("ELEVENLABS_API_KEY", key)
-    monkeypatch.setattr(tts, "_play", lambda path: None)
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
 
     mock_resp = mock.MagicMock()
     mock_resp.is_success = False
@@ -462,7 +474,7 @@ def test_riva_error_does_not_echo_the_key(monkeypatch):
     fake_riva, fake_encoding, service = _make_fake_riva()
     service.synthesize.side_effect = RuntimeError(f'bad metadata: Bearer {key}')
     monkeypatch.setattr(tts, "_import_riva", lambda: (fake_riva, fake_encoding))
-    monkeypatch.setattr(tts, "_play", lambda path: None)
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
 
     with pytest.raises(TTSError) as exc:
         tts.speak("Hello there.", FakeConfig())
@@ -498,28 +510,17 @@ def _wav(tmp_path, seconds=2.0, rate=8000):
     return str(path)
 
 
-def test_wav_seconds_reads_the_real_length(tmp_path):
-    assert tts._wav_seconds(_wav(tmp_path, seconds=1.5)) == pytest.approx(1.5, abs=0.01)
-
-
-def test_wav_seconds_is_zero_for_an_unreadable_file(tmp_path):
-    bad = tmp_path / "not.wav"
-    bad.write_bytes(b"definitely not a wav")
-
-    assert tts._wav_seconds(str(bad)) == 0.0
-
-
 def test_windows_playback_is_asynchronous(monkeypatch, tmp_path):
-    """Synchronous PlaySound is a blocking C call, so Python cannot deliver
-    KeyboardInterrupt until it returns - Ctrl+C sat queued until the audio
-    ended on its own, while the CLI was printing "Ctrl+C to skip"."""
+    """A synchronous PlaySound is a blocking call into the OS, so Python cannot
+    deliver KeyboardInterrupt until it returns - Ctrl+C sat queued until the
+    audio ended on its own, under a message promising it would skip."""
     fake = _FakeWinsound()
     monkeypatch.setattr(tts, "_import_winsound", lambda: fake)
     monkeypatch.setattr(tts.time, "sleep", lambda s: None)
 
-    tts._play_windows(_wav(tmp_path, seconds=1.0))
+    tts._play_windows(_wav(tmp_path, seconds=1.0), 1.0)
 
-    sound, flags = fake.calls[0]
+    _, flags = fake.calls[0]
     assert flags & fake.SND_ASYNC
     assert not any(f & fake.SND_PURGE for _, f in fake.calls)
 
@@ -527,43 +528,46 @@ def test_windows_playback_is_asynchronous(monkeypatch, tmp_path):
 def test_ctrl_c_during_playback_stops_the_audio(monkeypatch, tmp_path):
     fake = _FakeWinsound()
     monkeypatch.setattr(tts, "_import_winsound", lambda: fake)
-
-    def _interrupt(seconds):
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(tts.time, "sleep", _interrupt)
+    monkeypatch.setattr(tts.time, "sleep",
+                        lambda s: (_ for _ in ()).throw(KeyboardInterrupt))
 
     with pytest.raises(KeyboardInterrupt):
-        tts._play_windows(_wav(tmp_path, seconds=30.0))
+        tts._play_windows(_wav(tmp_path, seconds=30.0), 30.0)
 
     # Purged, so the sound stops now rather than playing out its 30 seconds.
     assert fake.calls[-1] == (None, fake.SND_PURGE)
 
 
-def test_an_unreadable_wav_still_plays(monkeypatch, tmp_path):
-    """With no duration there is nothing to wait for, so fall back to a plain
-    synchronous play rather than not playing at all."""
+def test_the_sound_is_started_on_the_calling_thread(monkeypatch, tmp_path):
+    """SND_PURGE only acts on the thread that started the sound. Handing
+    PlaySound to a worker thread and joining it reads better - the thread
+    returning would BE the completion signal, with no duration to know - but
+    measured on Windows, purging another thread's sound blocks for the
+    remainder of the audio (9.44s of a 10s file) instead of stopping it, which
+    turns Ctrl+C into a no-op that merely waits."""
     fake = _FakeWinsound()
     monkeypatch.setattr(tts, "_import_winsound", lambda: fake)
-    bad = tmp_path / "not.wav"
-    bad.write_bytes(b"nope")
+    monkeypatch.setattr(tts.time, "sleep", lambda s: None)
+    played_on = []
+    real = fake.PlaySound
 
-    tts._play_windows(str(bad))
+    def record(sound, flags):
+        played_on.append(threading.current_thread())
+        return real(sound, flags)
 
-    assert fake.calls == [(str(bad), fake.SND_FILENAME)]
+    fake.PlaySound = record
+    tts._play_windows(_wav(tmp_path, seconds=1.0), 1.0)
+
+    assert played_on == [threading.current_thread()]
 
 
 def test_an_interrupt_as_playback_starts_still_purges(monkeypatch, tmp_path):
-    """The window between starting async playback and entering the wait loop.
-    An interrupt landing there escaped the handler, so the CLI reported
-    "skipped audio" while the sound played on - the very symptom the async
-    change was made to fix - and left speak()'s os.remove failing silently on
-    a WAV still open for playback, leaking the temp file."""
+    """The window between starting the sound and entering the wait loop."""
     fake = _FakeWinsound()
-    real_play = fake.PlaySound
+    real = fake.PlaySound
 
     def _play(sound, flags):
-        real_play(sound, flags)
+        real(sound, flags)
         if flags & fake.SND_ASYNC:
             raise KeyboardInterrupt      # the signal arrives as playback starts
 
@@ -571,6 +575,172 @@ def test_an_interrupt_as_playback_starts_still_purges(monkeypatch, tmp_path):
     monkeypatch.setattr(tts, "_import_winsound", lambda: fake)
 
     with pytest.raises(KeyboardInterrupt):
-        tts._play_windows(_wav(tmp_path, seconds=30.0))
+        tts._play_windows(_wav(tmp_path, seconds=30.0), 30.0)
 
     assert fake.calls[-1] == (None, fake.SND_PURGE)
+
+
+def test_a_failing_purge_does_not_replace_the_interrupt(monkeypatch, tmp_path):
+    """SND_PURGE can raise RuntimeError of its own. If it did, it would discard
+    the KeyboardInterrupt and cli._speak would never print "skipped audio"."""
+    class _BadPurge(_FakeWinsound):
+        def PlaySound(self, sound, flags):
+            self.calls.append((sound, flags))
+            if flags & self.SND_PURGE:
+                raise RuntimeError("purge failed")
+
+    fake = _BadPurge()
+    monkeypatch.setattr(tts, "_import_winsound", lambda: fake)
+    monkeypatch.setattr(tts.time, "sleep",
+                        lambda s: (_ for _ in ()).throw(KeyboardInterrupt))
+
+    with pytest.raises(KeyboardInterrupt):
+        tts._play_windows(_wav(tmp_path, seconds=30.0), 30.0)
+
+
+def test_the_duration_comes_from_the_caller_not_the_header(monkeypatch, tmp_path):
+    """speak() wrote the PCM, so it knows the length exactly. Re-reading the
+    header meant a file we could not parse fell through to a synchronous play,
+    reinstating the uninterruptible bug this exists to fix."""
+    fake = _FakeWinsound()
+    monkeypatch.setattr(tts, "_import_winsound", lambda: fake)
+    slept = []
+    monkeypatch.setattr(tts.time, "sleep", lambda s: slept.append(s))
+    bad = tmp_path / "not.wav"
+    bad.write_bytes(b"nope")          # no readable header at all
+
+    tts._play_windows(str(bad), 0.3)
+
+    assert fake.calls[0][1] & fake.SND_ASYNC      # still asynchronous
+    assert slept                                  # still waited
+
+
+# ---------------------------------------------------------------------------
+# speak()'s guard was shaped for POSIX and applied to both platforms
+# ---------------------------------------------------------------------------
+
+def _speakable(monkeypatch, exc):
+    """A config that reaches playback, with _play raising ``exc``."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    monkeypatch.setattr(tts, "_check_playback", lambda: None)
+    monkeypatch.setattr(tts, "_synth_riva", lambda chunks, key, cfg: (b"pcm-data", 44100))
+    monkeypatch.setattr(tts, "_ADAPTERS", {"riva": tts._synth_riva})
+    monkeypatch.setattr(tts, "_play",
+                        lambda path, seconds=0.0: (_ for _ in ()).throw(exc))
+
+
+def test_a_winsound_runtime_error_becomes_a_tts_error(monkeypatch):
+    """winsound.PlaySound raises RuntimeError("Failed to play sound"), which is
+    not an OSError - so it escaped this guard, escaped cli._speak's except
+    TTSError, and tracebacked out of main() after the changelog had printed and
+    been paid for."""
+    _speakable(monkeypatch, RuntimeError("Failed to play sound"))
+
+    with pytest.raises(TTSError):
+        tts.speak("hello", FakeConfig())
+
+
+def test_a_missing_winsound_becomes_a_tts_error(monkeypatch):
+    """_import_winsound raises ImportError on a Windows build without it."""
+    _speakable(monkeypatch, ImportError("no winsound"))
+
+    with pytest.raises(TTSError):
+        tts.speak("hello", FakeConfig())
+
+
+def test_a_wave_error_becomes_a_tts_error(monkeypatch):
+    """wave.Error is not an OSError either, and setframerate raises it for a
+    non-positive rate. _wav_seconds already lists it; speak() did not."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    monkeypatch.setattr(tts, "_check_playback", lambda: None)
+    monkeypatch.setattr(tts, "_synth_riva", lambda chunks, key, cfg: (b"pcm", 0))
+    monkeypatch.setattr(tts, "_ADAPTERS", {"riva": tts._synth_riva})
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
+
+    with pytest.raises(TTSError):
+        tts.speak("hello", FakeConfig())
+
+
+def test_a_keyless_speech_endpoint_is_allowed(monkeypatch):
+    """A blank tts_api_key_env means "needs no key", exactly as llm.complete
+    already treats a blank api_key_env. It raised with an empty variable name
+    in the message instead - and the wizard can produce this value."""
+    seen = {}
+    monkeypatch.setattr(tts, "_check_playback", lambda: None)
+    monkeypatch.setattr(tts, "_synth_openai",
+                        lambda chunks, key, cfg: seen.update(key=key) or (b"pcm", 24000))
+    monkeypatch.setattr(tts, "_ADAPTERS", {"openai": tts._synth_openai})
+    monkeypatch.setattr(tts, "_play", lambda path, seconds=0.0: None)
+
+    tts.speak("hello", OpenAIConfig(tts_api_key_env="",
+                                   tts_base_url="http://127.0.0.1:8080/v1",
+                                   tts_model="local"))
+
+    assert seen["key"] == ""
+
+
+def test_a_named_but_unset_key_still_raises(monkeypatch):
+    """The keyless case must not swallow a genuine missing key."""
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setattr(tts, "_check_playback", lambda: None)
+
+    with pytest.raises(TTSError) as exc:
+        tts.speak("hello", FakeConfig())
+
+    assert "NVIDIA_API_KEY" in str(exc.value)
+
+
+def test_an_elevenlabs_voice_id_is_percent_encoded(monkeypatch):
+    """A voice id is an opaque per-account string. Unencoded, a "#" in it made
+    everything after it a URL fragment - dropping output_format=pcm_24000, so
+    ElevenLabs returned MP3, which we wrote into a WAV header as 24 kHz PCM and
+    played as loud garbage."""
+    seen = {}
+    resp = mock.Mock(status_code=200, content=b"pcm")
+    resp.raise_for_status = lambda: None
+    with mock.patch("voicelog.tts.httpx.post",
+                    side_effect=lambda url, **kw: seen.update(url=url) or resp):
+        tts._synth_elevenlabs(["hi"], "k", ElevenLabsConfig(tts_voice="voice#1 with spaces"))
+
+    assert "#" not in seen["url"].split("?")[0].split("/text-to-speech/")[1]
+    assert "output_format=pcm_24000" in seen["url"]
+
+
+def test_a_keyless_openai_endpoint_sends_no_auth_header(monkeypatch):
+    """A blank tts_api_key_env means the endpoint needs no key. Sending
+    "Authorization: Bearer " is not the same as sending nothing - a local
+    server can reject a malformed header outright. llm.complete omits it."""
+    seen = {}
+    resp = mock.Mock(status_code=200, content=b"pcm", is_success=True)
+    resp.raise_for_status = lambda: None
+    cfg = OpenAIConfig(tts_api_key_env="", tts_base_url="http://127.0.0.1:8080/v1")
+
+    with mock.patch("voicelog.tts.httpx.post",
+                    side_effect=lambda url, **kw: seen.update(kw) or resp):
+        tts._synth_openai(["hi"], "", cfg)
+
+    assert "Authorization" not in seen["headers"]
+
+
+def test_a_keyed_openai_endpoint_still_sends_the_header(monkeypatch):
+    seen = {}
+    resp = mock.Mock(status_code=200, content=b"pcm", is_success=True)
+    resp.raise_for_status = lambda: None
+
+    with mock.patch("voicelog.tts.httpx.post",
+                    side_effect=lambda url, **kw: seen.update(kw) or resp):
+        tts._synth_openai(["hi"], "sk-real", OpenAIConfig())
+
+    assert seen["headers"]["Authorization"] == "Bearer sk-real"
+
+
+def test_a_keyless_elevenlabs_endpoint_sends_no_key_header(monkeypatch):
+    seen = {}
+    resp = mock.Mock(status_code=200, content=b"pcm", is_success=True)
+    resp.raise_for_status = lambda: None
+
+    with mock.patch("voicelog.tts.httpx.post",
+                    side_effect=lambda url, **kw: seen.update(kw) or resp):
+        tts._synth_elevenlabs(["hi"], "", ElevenLabsConfig())
+
+    assert "xi-api-key" not in seen["headers"]

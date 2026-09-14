@@ -71,8 +71,17 @@ speech engine is a config change, never a code change. Adding an LLM provider is
 one `PROVIDERS` entry and no code. `tts` picks its adapter
 via `config.tts_provider`; each adapter takes chunked text + an API key and
 returns `(pcm_bytes, sample_rate)` — the shared code stitches one WAV and plays
-it cross-platform. Add a new speech provider by writing one `_synth_<name>`
-function and registering it in `_ADAPTERS`.
+it cross-platform.
+
+**One provider table.** Every fact about a backend — endpoint, key env var,
+voices, default model, sample rate — lives in `providers.PROVIDERS` /
+`TTS_PROVIDERS` and nowhere else. `config.DEFAULTS` reads NVIDIA's and Riva's
+values from those presets rather than restating them, and `wizard._LLM_TO_TTS`
+is derived by matching key variables. Adding a speech backend is one
+`TTS_PROVIDERS` entry plus one `_synth_<name>` in `_ADAPTERS`; a test asserts
+`set(_ADAPTERS) | {NO_TTS_KEY} == set(TTS_PROVIDERS)`, so the two cannot drift.
+The adapter code stays in `tts` deliberately: putting a `synth` callable on the
+preset would make `providers` import `tts` while `tts` imports `providers`.
 
 ## Conventions (please follow these)
 
@@ -89,8 +98,10 @@ sets `VOICELOG_NO_SETUP` so the wizard can never fire, and fails any unmocked
 HTTP call. Do not work around them — an unmocked request would otherwise hit a
 real provider with your real key.
 
-**2. Adding a config field.** Add it in three places in `voicelog/config.py`:
-`DEFAULTS`, the `Config` dataclass, and `_build()`. Give **new** dataclass fields
+**2. Adding a config field.** Add it in four places in `voicelog/config.py`:
+`DEFAULTS`, the `Config` dataclass, `_build()`, and the validation group tuple it
+belongs to (`_STR_KEYS`, `_POSITIVE_INT_KEYS`, `_URL_KEYS`, …). A key in no group is
+accepted unvalidated, which is how `provider` used to take any string at all. Give **new** dataclass fields
 a default value (e.g. `foo: int = 5`) so existing `Config(...)` call sites and
 test fixtures keep working. Document it in `changelog.yml`.
 
@@ -111,12 +122,25 @@ stderr and the run still produces useful output (see the error handling in
 --setup`) but still exits 0 with the commit-list fallback, so nobody's pre-push
 hook or CI job starts failing. Preserve this when you touch the pipeline.
 
-**A CLI flag seeds a preset only when it changes something.** `_apply_overrides`
-runs twice — once on the main path and again on the config the wizard just wrote — so
-restating the current provider must be a no-op. Reseeding unconditionally silently
-reset a `base_url` and key env var the user had typed into the wizard seconds earlier.
-For the same reason `_apply_overrides` must stay free of side effects; flag *validation*
-belongs in `_validate_flags`.
+**One config boundary: flags are a layer, not a second pass.** `config.load` merges
+`DEFAULTS < user config < ./changelog.yml < flags`, and `cli._flag_overrides` only turns
+`args` into a dict. Validation, canonicalisation, URL normalisation and preset
+reconciliation all happen once, inside `load`, so a setting means the same thing however
+it arrived. Flags used to be applied *after* load by `_apply_overrides`, which therefore
+had to re-implement all of that — and the file path simply went without it. Roughly a
+third of one review's findings reduced to "the flag path handles this, the file path
+doesn't": `provider: openai` in a file kept NVIDIA's endpoint and key var while every
+error said "openai".
+
+**A provider name seeds its preset only when it changes something.** The rule is
+per-layer: when a layer sets `provider` to something other than what the layers beneath
+it resolved to, every preset-owned key that layer does not set itself comes from the
+preset. Firing only on a *change* is what lets the wizard write a hand-typed `base_url`
+next to `provider: nvidia` and keep it — and it matters because the flag layer is applied
+twice, once on the main path and again on the config the wizard just wrote.
+`_validate_flags` now holds only what no validator downstream can see (mutually exclusive
+flags, and `--provider custom` needing `--base-url`); a value that is merely wrong is
+config's business. A flag-origin failure exits 2, a file-origin one exits 1.
 
 **A bad config *value* is not a bad config *file*.** `ConfigValueInvalid` is separate from
 `ConfigFileInvalid` because the repair is opposite: a parse error has nothing worth keeping, so

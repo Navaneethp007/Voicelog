@@ -10,7 +10,7 @@ import json
 import os
 import subprocess
 
-from voicelog import state
+from voicelog import gitsource, state
 
 
 def make_repo(tmp_path):
@@ -171,3 +171,34 @@ def test_writing_state_leaves_the_work_tree_clean(tmp_path, monkeypatch):
     state.record_summarised("a" * 40)
 
     assert run("git", "status", "--porcelain").stdout.strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# state shares gitsource's git boundary
+# ---------------------------------------------------------------------------
+
+def test_private_path_decodes_a_non_ascii_repo_path(tmp_path, monkeypatch):
+    """rev-parse echoes the repo path back. Decoded through cp1252 that becomes
+    a mojibake directory, which cache._write then creates as junk beside the
+    real repo - two caches, neither found by the other."""
+    repo = tmp_path / "репо"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], capture_output=True)
+
+    path = state.private_path("cache.json", str(repo))
+
+    assert path is not None
+    assert "репо" in path
+
+
+def test_private_path_uses_the_shared_git_runner(tmp_path, monkeypatch):
+    """One git boundary: state had its own subprocess.run, so every fix to the
+    runner had to be remembered twice."""
+    calls = []
+    real = gitsource._run          # captured before patching, or the spy calls itself
+    monkeypatch.setattr(state.gitsource, "_run",
+                        lambda *a: calls.append(a) or real(*a))
+
+    state.private_path("cache.json", str(tmp_path))
+
+    assert calls, "private_path did not go through gitsource._run"

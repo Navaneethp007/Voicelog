@@ -1,7 +1,9 @@
 """Tests for voicelog.cache — generation cache keyed on the commit set."""
 from __future__ import annotations
 
+import json
 import os
+import stat
 import subprocess
 
 from voicelog import cache as cache_module
@@ -410,3 +412,87 @@ def test_last_does_not_expose_the_key(tmp_path):
     entry = last(str(tmp_path))
 
     assert not hasattr(entry, "key")
+
+
+# ---------------------------------------------------------------------------
+# A read-only cache.json is the one write failure that repeats forever
+# ---------------------------------------------------------------------------
+
+def test_a_read_only_cache_file_is_repaired_and_written(tmp_path):
+    """The cache is voicelog's own scratch data inside the repo's git
+    directory, so a read-only bit on it is an accident - a restore, a sync
+    tool, a stray attrib - not an intention. Left alone, os.replace onto it
+    fails forever and every future run re-pays for an identical range."""
+    repo, _ = _make_repo(tmp_path)
+    assert put(str(repo), "k1", "## first") is True
+    path = cache_module._cache_path(str(repo))
+    os.chmod(path, stat.S_IREAD)
+
+    try:
+        assert put(str(repo), "k2", "## second") is True
+        assert get(str(repo), "k2") == "## second"
+    finally:
+        os.chmod(path, stat.S_IWRITE)
+
+
+def test_a_genuinely_unwritable_location_still_returns_false(tmp_path, monkeypatch):
+    """The retry must not turn a real failure into a false success."""
+    monkeypatch.setattr(cache_module.fileio, "atomic_write_text",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("read-only fs")))
+
+    assert put(str(tmp_path), "k1", "## md") is False
+
+
+def test_the_warning_says_replay_will_not_have_it(tmp_path, monkeypatch, capsys):
+    """"will not be reused" reads as a performance note. The user also loses
+    the ability to get this run's text back at all, which is the part worth
+    knowing while the text is still on screen."""
+    monkeypatch.setattr(cache_module.fileio, "atomic_write_text",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("read-only fs")))
+
+    put(str(tmp_path), "k1", "## md")
+
+    assert "--replay" in capsys.readouterr().err
+
+
+def test_a_null_summaries_field_is_a_miss_not_a_crash(tmp_path):
+    """data.get("summaries", {}) returns the stored value when the key is
+    present but null, so .get on it raised AttributeError. last() shape-checks
+    this exact field and says why; the key-gated readers did not."""
+    path = os.path.join(str(tmp_path), ".changelog", ".voicelog-cache.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"key": "k1", "markdown": "## md", "summaries": None}, fh)
+
+    assert get_summary(str(tmp_path), "k1", False) is None
+
+
+def test_a_non_dict_summaries_field_is_a_miss(tmp_path):
+    path = os.path.join(str(tmp_path), ".changelog", ".voicelog-cache.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"key": "k1", "markdown": "## md", "summaries": ["nope"]}, fh)
+
+    assert get_summary(str(tmp_path), "k1", True) is None
+
+
+def test_put_summary_replaces_a_broken_summaries_field(tmp_path):
+    """setdefault returns the stored None, so the write then failed too."""
+    path = os.path.join(str(tmp_path), ".changelog", ".voicelog-cache.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"key": "k1", "markdown": "## md", "summaries": None}, fh)
+
+    assert put_summary(str(tmp_path), "k1", False, "spoken") is True
+    assert get_summary(str(tmp_path), "k1", False) == "spoken"
+
+
+def test_a_non_string_markdown_is_a_miss(tmp_path):
+    """last() and get_summary() both shape-check what they read back; get()
+    did not, so a non-string under a matching key reached render.render."""
+    path = os.path.join(str(tmp_path), ".changelog", ".voicelog-cache.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"key": "k1", "markdown": ["not", "a", "string"]}, fh)
+
+    assert get(str(tmp_path), "k1") is None

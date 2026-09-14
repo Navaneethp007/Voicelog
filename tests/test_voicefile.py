@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from voicelog.voicefile import update_voice_md
 
 
@@ -230,3 +232,60 @@ def test_the_default_location_is_unchanged(tmp_path):
     update_voice_md(str(tmp_path), "## Unreleased\n\n- a thing\n", None)
 
     assert (tmp_path / ".changelog" / "voice.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# voice.md is the one artifact that cannot be regenerated
+# ---------------------------------------------------------------------------
+
+def test_a_failed_write_does_not_destroy_the_existing_changelog(tmp_path, monkeypatch):
+    """open(path, "w") truncates before writing, so an interrupt or a full disk
+    left voice.md empty. The cache and the state file - both explicitly
+    disposable - were the ones written atomically; this one was not."""
+    from voicelog import fileio
+    path = tmp_path / ".changelog" / "voice.md"
+    path.parent.mkdir(parents=True)
+    original = chr(10).join([
+        "<!-- voicelog:last-tag=v1.0.0 -->", "## Unreleased", "", "- months of history", ""
+    ])
+    path.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(fileio.os, "replace",
+                        lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+
+    with pytest.raises(OSError):
+        update_voice_md(str(tmp_path), chr(10).join(["## Unreleased", "", "- a new thing", ""]),
+                        "v1.0.0")
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_undecodable_history_is_not_rewritten_as_replacement_chars(tmp_path):
+    """errors="replace" is right for input you only read and wrong for a
+    read-modify-write: decoding then writing the result back turns every
+    undecodable byte into U+FFFD *permanently*, in the one file this package
+    calls unrecoverable. Refusing leaves it exactly as it was."""
+    path = tmp_path / ".changelog" / "voice.md"
+    path.parent.mkdir(parents=True)
+    raw = (("<!-- voicelog:last-tag=v1 -->" + chr(10) + "## Unreleased" + chr(10) * 2
+            + "- old" + chr(10) * 2 + "## v0.9" + chr(10) * 2 + "- caf").encode("utf-8")
+           + bytes([0xE9]) + (" notes" + chr(10)).encode("utf-8"))
+    path.write_bytes(raw)
+
+    with pytest.raises(UnicodeDecodeError):
+        update_voice_md(str(tmp_path), "## Unreleased" + chr(10) * 2 + "- new" + chr(10),
+                        "v1")
+
+    assert path.read_bytes() == raw
+
+
+def test_valid_non_ascii_history_is_preserved(tmp_path):
+    """Refusing on undecodable bytes must not refuse ordinary UTF-8."""
+    path = tmp_path / ".changelog" / "voice.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("<!-- voicelog:last-tag=v1 -->" + chr(10) + "## Unreleased" + chr(10) * 2
+                    + "- old" + chr(10) * 2 + "## v0.9" + chr(10) * 2 + "- café ☕" + chr(10),
+                    encoding="utf-8")
+
+    update_voice_md(str(tmp_path), "## Unreleased" + chr(10) * 2 + "- new" + chr(10), "v1")
+
+    assert "café ☕" in path.read_text(encoding="utf-8")

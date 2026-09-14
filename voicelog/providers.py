@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from voicelog.redact import redact
+from voicelog.redact import detail as safe_detail
 
 # Discovery must feel instant. llm_timeout (120s) in a wizard reads as a hang.
 _DISCOVERY_TIMEOUT = httpx.Timeout(connect=3.0, read=8.0, write=8.0, pool=3.0)
@@ -53,6 +53,19 @@ class TTSProvider:
     api_key_env: str
     voices: tuple[str, ...] = ()  # known ids offered as a picker; may be empty
     voice_hint: str = ""
+
+    # Where the backend lives and what it defaults to. These used to sit in
+    # tts.py as `or "gpt-4o-mini-tts"` fallbacks - a shadow default table for
+    # exactly the keys config.DEFAULTS deliberately leaves blank, so "the
+    # default speech model" had no single home and no way to be checked.
+    base_url: str = ""
+    model: str = ""
+    sample_rate: int = 0          # Hz the adapter returns; 0 = caller decides
+
+    # Riva-only, and still flat data rather than a branch: the NVCF function to
+    # call and the language it synthesises.
+    function_id: str = ""
+    language: str = ""
 
 
 PROVIDERS: dict[str, Provider] = {
@@ -117,6 +130,10 @@ TTS_PROVIDERS: dict[str, TTSProvider] = {
             "Magpie-Multilingual.EN-US.Ray",
         ),
         "a Magpie voice name",
+        base_url="grpc.nvcf.nvidia.com:443",   # gRPC, not HTTP
+        sample_rate=44100,
+        function_id="877104f7-e885-42b9-8de8-f6e4c6303969",
+        language="en-US",
     ),
     "openai": TTSProvider(
         "openai",
@@ -124,6 +141,9 @@ TTS_PROVIDERS: dict[str, TTSProvider] = {
         "OPENAI_API_KEY",
         ("alloy", "echo", "fable", "onyx", "nova", "shimmer"),
         "a voice name",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o-mini-tts",
+        sample_rate=24000,
     ),
     "elevenlabs": TTSProvider(
         "elevenlabs",
@@ -131,6 +151,9 @@ TTS_PROVIDERS: dict[str, TTSProvider] = {
         "ELEVENLABS_API_KEY",
         (),
         "your ElevenLabs voice id",
+        base_url="https://api.elevenlabs.io/v1",
+        model="eleven_multilingual_v2",
+        sample_rate=24000,
     ),
     NO_TTS_KEY: TTSProvider(
         NO_TTS_KEY,
@@ -191,11 +214,11 @@ def _parse_models(payload: object) -> list[str]:
     return sorted(ids)
 
 
-def _headers(api_key: str | None) -> dict[str, str]:
-    headers = {"Accept": "application/json"}
+def headers(api_key: str | None) -> dict[str, str]:
+    built = {"Accept": "application/json"}
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    return headers
+        built["Authorization"] = f"Bearer {api_key}"
+    return built
 
 
 # A model that has to cold-start can take well over 30s to answer. Setup is not
@@ -297,7 +320,7 @@ def _error_detail(response, api_key: str | None) -> str:
     message = error.get("message") if isinstance(error, dict) else None
     if not isinstance(message, str) or not message.strip():
         return ""
-    return redact(message.strip(), api_key)[:_MAX_DETAIL_CHARS]
+    return safe_detail(message.strip(), api_key, limit=_MAX_DETAIL_CHARS)
 
 
 def verify_model(
@@ -330,12 +353,12 @@ def verify_model(
         try:
             response = httpx.post(
                 url,
-                headers=_headers(api_key),
+                headers=headers(api_key),
                 json=payload,
                 timeout=timeout or _VERIFY_TIMEOUT,
             )
         except Exception as exc:  # noqa: BLE001 - verification never interrupts setup
-            return f"could not verify ({redact(str(exc), api_key)})"
+            return f"could not verify ({safe_detail(str(exc), api_key)})"
 
         if response.status_code != 400:
             break
@@ -384,14 +407,19 @@ def fetch_models(base_url: str, api_key: str | None, timeout=None) -> list[str]:
     try:
         response = httpx.get(
             url,
-            headers=_headers(api_key),
+            headers=headers(api_key),
             timeout=timeout or _DISCOVERY_TIMEOUT,
         )
     except Exception as exc:  # noqa: BLE001 - discovery is never fatal
         # Deliberately broad, matching verify_model: a failure here must always
         # fall back to typing a model id, never end setup. httpx.InvalidURL is
         # not an HTTPError, so a narrow catch let a pasted URL kill --setup.
-        raise ProviderError(f"could not reach {url} ({exc})") from exc
+        # Redacted, as verify_model already does for the identical case: httpx
+        # echoes the request URL in several of its messages, so a key that
+        # arrived inside a pasted base_url would otherwise reach the terminal.
+        raise ProviderError(
+            f"could not reach {url} ({safe_detail(str(exc), api_key)})"
+        ) from exc
 
     if not response.is_success:
         raise ProviderError(f"{url} returned HTTP {response.status_code}")

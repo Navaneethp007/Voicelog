@@ -4,13 +4,14 @@ All tests mock llm.complete or httpx.post — no real HTTP calls are made.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 from unittest.mock import MagicMock, patch, call
 
 import pytest
 
+from voicelog import config as config_module
 from voicelog.models import Commit
-from voicelog.config import Config, DEFAULTS
 from voicelog.llm import (
     complete, MissingApiKey, LLMError, MissingModel, ModelUnavailable, InvalidApiKey,
 )
@@ -23,20 +24,12 @@ from voicelog.generate import generate, summarize, onboard
 
 @pytest.fixture()
 def config():
-    return Config(
-        provider=DEFAULTS["provider"],
-        base_url=DEFAULTS["base_url"],
-        model="test-model",  # never DEFAULTS["model"]: there is no default model
-        sections=list(DEFAULTS["sections"]),
-        noise=list(DEFAULTS["noise"]),
-        voice_samples=DEFAULTS["voice_samples"],
-        fallback_commits=int(DEFAULTS["fallback_commits"]),
-        speak=DEFAULTS["speak"],
-        tts_function_id=DEFAULTS["tts_function_id"],
-        tts_voice=DEFAULTS["tts_voice"],
-        tts_language=DEFAULTS["tts_language"],
-        tts_sample_rate=DEFAULTS["tts_sample_rate"],
-        voice_md=DEFAULTS["voice_md"],
+    # defaults_config() rather than thirteen hand-passed fields: a fake that
+    # lists them itself drifts from the schema, and drifting fakes are what
+    # kept fourteen unreachable getattr guards alive in production.
+    return dataclasses.replace(
+        config_module.defaults_config(),
+        model="test-model",   # there is deliberately no default model
     )
 
 
@@ -229,7 +222,6 @@ def test_complete_raises_missing_api_key_when_env_var_absent(config):
 
 # 6b. Reads the API key from the env var named in config.api_key_env
 def test_complete_uses_configured_key_env(config):
-    import dataclasses
     cfg = dataclasses.replace(config, api_key_env="MY_PROVIDER_KEY")
     messages = [{"role": "user", "content": "Hello"}]
 
@@ -250,7 +242,6 @@ def test_complete_uses_configured_key_env(config):
 
 # 6c. MissingApiKey names the configured env var
 def test_missing_key_message_names_configured_env(config):
-    import dataclasses
     cfg = dataclasses.replace(config, api_key_env="OPENAI_API_KEY")
     with patch.dict(os.environ, {}, clear=True):
         with pytest.raises(MissingApiKey) as exc:
@@ -766,3 +757,22 @@ def test_the_verifier_negotiates_too(config, monkeypatch):
     with patch("voicelog.providers.httpx.post",
                side_effect=[_unsupported("max_tokens"), _ok()]):
         assert providers.verify_model("https://x/v1", "k", "openai/o4-mini") is None
+
+
+def test_a_provider_error_body_keeps_its_whole_budget(config):
+    """The body is deliberately budgeted at _MAX_BODY_CHARS. Wrapping the
+    finished message in detail() again re-truncated it to the 200-char default,
+    silently discarding a third of the diagnostic that budget exists to keep."""
+    import os
+    from voicelog.llm import _MAX_BODY_CHARS
+
+    os.environ["NVIDIA_API_KEY"] = "k"
+    body = "E" * 600
+    resp = MagicMock(status_code=400, is_success=False, text=body)
+
+    with patch("voicelog.llm.httpx.post", return_value=resp):
+        with pytest.raises(LLMError) as exc:
+            complete("prompt", config)
+
+    kept = str(exc.value).count("E")
+    assert kept >= _MAX_BODY_CHARS - 20, f"only {kept} of {_MAX_BODY_CHARS} kept"

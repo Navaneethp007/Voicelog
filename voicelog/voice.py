@@ -1,6 +1,8 @@
 """Load voice samples from a directory of .md / .txt files."""
 import os
 
+from voicelog import fileio
+
 
 def load_voice(dir_path: str) -> str:
     """Read up to 3 .md or .txt files from dir_path and return a few-shot style string.
@@ -23,8 +25,7 @@ def load_voice(dir_path: str) -> str:
     parts = ["Here are past changelogs to imitate the voice of:"]
     for i, filename in enumerate(files, start=1):
         filepath = os.path.join(dir_path, filename)
-        with open(filepath, "r", encoding="utf-8") as fh:
-            content = fh.read()
+        content = fileio.read_text(filepath)
         parts.append(f"\n--- sample {i} ---\n{content}")
 
     return "\n".join(parts)

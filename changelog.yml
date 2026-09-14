@@ -17,8 +17,12 @@
 # retired, so `voicelog --setup` reads the live catalogue instead of trusting a
 # value shipped months ago.
 #
+# Setting `provider:` alone is enough: base_url and api_key_env come from that
+# provider's preset, exactly as `--provider <name>` has always done. Set one of
+# them yourself and yours wins - the preset only fills what you leave out.
+#
 # provider: nvidia          # nvidia | openai | groq | openrouter | ollama | custom
-# base_url: https://integrate.api.nvidia.com/v1
+# base_url: https://integrate.api.nvidia.com/v1   # only to override the preset
 # model: <a live id from your provider>
 # api_key_env: NVIDIA_API_KEY   # name of the env var only; never the key itself
 
@@ -58,7 +62,10 @@ onboard_commits: 15
 # Which voice you like is personal too, so `voicelog --setup` writes it to your
 # user config. Uncomment here only to force one voice for the whole project.
 #
-#   tts_provider: riva | openai | elevenlabs
+# As above, `tts_provider:` alone brings its own key var and voice; `none`
+# means no audio at all.
+#
+#   tts_provider: riva | openai | elevenlabs | none
 #   tts_voice:    a Magpie voice name | alloy/echo/fable/onyx/nova/shimmer | an
 #                 ElevenLabs voice id
 #   tts_api_key_env: name of the env var holding the speech key

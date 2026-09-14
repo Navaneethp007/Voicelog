@@ -39,21 +39,12 @@ def _interactive() -> bool:
     return wizard.can_prompt()
 
 
-def _reject_choice(flag: str, value: str, valid) -> None:
-    """Fail a bad preset name loudly, naming what would have worked."""
-    print(
-        f"error: unknown {flag} '{value}' - choose one of: {', '.join(valid)}",
-        file=sys.stderr,
-    )
-    sys.exit(2)
-
-
 def _validate_flags(args: argparse.Namespace) -> None:
     """Reject flag values and combinations that cannot mean anything.
 
-    A typo'd --provider would otherwise keep the previous endpoint and surface
-    much later as "model was rejected", which blames the wrong thing. Runs
-    before the config is even read, so a typo fails fast either way.
+    Only combinations that no validator downstream can see: a value that is
+    merely *wrong* is config's business, and is checked there for flags and
+    files alike.
     """
     # --fresh means "ignore the cache", --replay means "read only the cache".
     # No run satisfies both, and silently picking one would hand the user the
@@ -65,10 +56,10 @@ def _validate_flags(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    if args.provider and providers.get(args.provider) is None:
-        _reject_choice("--provider", args.provider, providers.PROVIDERS)
-    if args.tts_provider and providers.get_tts(args.tts_provider) is None:
-        _reject_choice("--tts-provider", args.tts_provider, providers.TTS_PROVIDERS)
+    # Membership is NOT checked here. config.load validates every layer against
+    # the provider registries, so a typo'd name is caught there whether it was
+    # typed as a flag or written in a file - which is the point. main() maps a
+    # flag-origin failure back to exit 2, argparse's convention for usage.
 
     # "custom" is not a provider, it is a promise to name the endpoint. Without
     # one it would keep whatever endpoint was already configured and just
@@ -83,83 +74,65 @@ def _validate_flags(args: argparse.Namespace) -> None:
         sys.exit(2)
 
 
-def _apply_overrides(cfg, args: argparse.Namespace):
-    """Apply CLI flags as the highest-precedence config layer.
+def _defaults_with_flags(overrides: dict, overrides_origin: dict):
+    """A Config from DEFAULTS plus the flags, for the config-is-broken paths.
 
-    The only place voicelog changes a loaded Config, and it does it by
-    replacement, so cfg stays immutable everywhere downstream.
-
-    **A preset is seeded only when the provider actually changes.** Restating
-    the provider you already use is a no-op, which matters because this runs
-    twice - once on the main path and again on the config the wizard just wrote
-    (see `_run_setup`). Reseeding unconditionally meant `--provider openai`
-    silently reset a base_url and key env var the user had typed into the wizard
-    seconds earlier. The visible trade: `--provider nvidia` on a hand-pointed
-    base_url keeps that URL rather than resetting it to NVIDIA's.
+    Any ConfigValueInvalid here can only come from a flag - DEFAULTS validate,
+    and no file is read - so it is the same usage error as on the normal path
+    and gets the same exit code. Without this the recovery branches revalidated
+    the flags with nothing to catch the result, so a broken config plus a
+    typo'd --provider raised a chained traceback instead of exiting 2. Only
+    reachable once flag validation moved into config.
     """
-    changes: dict = {}
-    silenced = False
+    try:
+        return config_module.defaults_config(overrides, overrides_origin)
+    except ConfigValueInvalid as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _flag_overrides(args: argparse.Namespace) -> tuple[dict, dict]:
+    """Turn the flags into a config layer, plus where each value came from.
+
+    Returns ``(values, origin)`` for ``config.load``. This used to be
+    ``_apply_overrides``, which rebuilt a finished Config *after* load and so
+    had to re-implement preset reconciliation, canonicalisation and membership
+    checks that the file path then lacked - the single largest source of
+    "the flag path handles this, the file path doesn't" defects.
+
+    Nothing here reconciles or validates: a flag is just the top layer, and
+    ``config.load`` applies the same rules to it as to every file below.
+    """
+    values: dict = {}
+    origin: dict = {}
+
+    def put(key: str, value, flag: str) -> None:
+        values[key] = value
+        origin[key] = flag
 
     if args.provider:
-        # _validate_flags has already rejected unknown names, so the preset
-        # exists; its .key is the canonical spelling (stripped, lowercased).
-        # Storing args.provider raw would leak padding into the cache key.
-        preset = providers.get(args.provider)
-        key = preset.key if preset else args.provider.strip().lower()
-        if key != cfg.provider and preset and preset.base_url:
-            changes["base_url"] = preset.base_url
-            changes["api_key_env"] = preset.api_key_env
-        changes["provider"] = key
-
-    # ...then anything explicit overrides the preset.
+        put("provider", args.provider, "--provider")
     if args.base_url:
-        changes["base_url"] = providers.normalize_base_url(args.base_url)
+        put("base_url", args.base_url, "--base-url")
     if args.api_key_env is not None:  # "" means "this endpoint needs no key"
-        changes["api_key_env"] = args.api_key_env
+        put("api_key_env", args.api_key_env, "--api-key-env")
     if args.model:
-        changes["model"] = args.model.strip()
+        put("model", args.model, "--model")
 
     if args.tts_provider:
-        tts_preset = providers.get_tts(args.tts_provider)
-        tts_key = tts_preset.key if tts_preset else args.tts_provider.strip().lower()
-        if tts_key == providers.NO_TTS_KEY:
-            # `none` is offered in the wizard, so it means the same thing here,
-            # and it beats the implied "on" from naming a voice below.
-            changes["speak"] = False
-            silenced = True
-        elif tts_key != cfg.tts_provider:
-            # A real switch: take the whole preset, because every one of these
-            # is backend-specific. Carrying them over would send an NVIDIA key
-            # as an ElevenLabs header, a Magpie voice name as an ElevenLabs
-            # voice id, an OpenAI tts_model as ElevenLabs' model_id, and an
-            # OpenAI proxy URL to a different service entirely.
-            changes["tts_provider"] = tts_key
-            changes["tts_api_key_env"] = tts_preset.api_key_env
-            # Blank where there is no sensible default (ElevenLabs ids are
-            # per-account) so tts.py gives its actionable "needs tts_voice set
-            # to a voice id".
-            changes["tts_voice"] = tts_preset.voices[0] if tts_preset.voices else ""
-            changes["tts_model"] = ""
-            changes["tts_base_url"] = ""
-        else:
-            changes["tts_provider"] = tts_key
-
-        if not silenced:
-            # Naming a backend means wanting audio: with `speak: false` in the
-            # config this flag was otherwise a silent no-op - nothing played,
-            # and nothing said why. --no-speak still wins, because that is
-            # applied where speech is attempted, not here.
-            changes["speak"] = True
-
-    # ...and an explicit --voice wins over whatever the preset chose. Naming a
-    # voice means wanting to hear it, for the same reason.
+        put("tts_provider", args.tts_provider, "--tts-provider")
+        # Naming a backend means wanting audio, even with `speak: false`
+        # configured - otherwise the flag is a silent no-op. `none` is the
+        # exception and config.load derives speak=False from it. --no-speak
+        # still wins, because it is applied where speech is attempted.
+        if args.tts_provider.strip().lower() != providers.NO_TTS_KEY:
+            put("speak", True, "--tts-provider")
     if args.voice:
-        changes["tts_voice"] = args.voice
-        if not silenced:
-            changes.setdefault("speak", True)
+        put("tts_voice", args.voice, "--voice")
+        values.setdefault("speak", True)
+        origin.setdefault("speak", "--voice")
 
-    return dataclasses.replace(cfg, **changes) if changes else cfg
-
+    return values, origin
 
 def _needs_setup(cfg, args: argparse.Namespace) -> bool:
     """Whether this is a genuine first run: nothing to call, nothing configured.
@@ -221,8 +194,11 @@ def _run_setup(args: argparse.Namespace, cfg, *, resume: bool = False):
 
     try:
         values = wizard.run_setup(dataclasses.asdict(cfg), dest=dest)
-    except wizard.SetupAborted:
+    except wizard.SetupAborted as exc:
         print("Setup cancelled - nothing was written.", file=sys.stderr)
+        if exc.interrupted:
+            # Resuming is right for "not now" and wrong for "stop".
+            raise KeyboardInterrupt from None
         if resume:
             return None
         sys.exit(1)
@@ -236,6 +212,12 @@ def _run_setup(args: argparse.Namespace, cfg, *, resume: bool = False):
         print(f"error: could not write {dest} ({exc})", file=sys.stderr)
         print("Save this yourself to keep the settings:", file=sys.stderr)
         print(yaml.safe_dump(values, sort_keys=False), file=sys.stderr)
+        if resume:
+            # Same rule as the SetupAborted handler above: on an implicit first
+            # run, setup is an offer, and a failed offer must not take down the
+            # command the user actually typed. An unwritable home did exactly
+            # that. Explicit --setup is a mode, so there it still exits 1.
+            return None
         sys.exit(1)
 
     print(f"Saved to {written}", file=sys.stderr)
@@ -246,7 +228,7 @@ def _run_setup(args: argparse.Namespace, cfg, *, resume: bool = False):
 
     # Reload rather than building a Config from `values`: one merge path, and it
     # re-asserts flag precedence over what was just written.
-    return _apply_overrides(config_module.load(args.config), args)
+    return config_module.load(args.config, *_flag_overrides(args))
 
 
 def _resolve_since_last() -> str | None:
@@ -312,6 +294,28 @@ def _speak(text: str, cfg) -> None:
         print("\nskipped audio.", file=sys.stderr)
 
 
+def _offer_key(env_name: str, **kwargs) -> None:
+    """Offer to paste a key, treating a refusal as an answer.
+
+    wizard.ensure_key prompts, and every prompt turns EOF and Ctrl-C into
+    SetupAborted. That was caught in exactly one place - inside _run_setup - so
+    Ctrl-D at the key prompt on the ordinary path, which is where a fresh shell
+    with no key set meets it, produced a bare traceback. Declining to paste a
+    key is not declining the command: the run carries on to either a key
+    already in the environment or its own actionable missing-key error.
+    """
+    try:
+        wizard.ensure_key(env_name, **kwargs)
+    except wizard.SetupAborted as exc:
+        print(file=sys.stderr)
+        if exc.interrupted:
+            # Ctrl+C is not an answer to "paste your key?" - it is an answer to
+            # the command. Swallowing it here let the run continue into commit
+            # reading, a paid model call, the voice.md write and a TTS attempt
+            # after the user had asked it to stop.
+            raise KeyboardInterrupt from None
+
+
 def _ensure_speech_key(cfg, args: argparse.Namespace, *, already_asked: str = "") -> None:
     """Offer to paste the key speech needs, if we are going to speak.
 
@@ -329,7 +333,7 @@ def _ensure_speech_key(cfg, args: argparse.Namespace, *, already_asked: str = ""
         and cfg.tts_api_key_env
         and cfg.tts_api_key_env != already_asked
     ):
-        wizard.ensure_key(cfg.tts_api_key_env, label=cfg.tts_provider)
+        _offer_key(cfg.tts_api_key_env, label=cfg.tts_provider)
 
 
 def _run_replay(args: argparse.Namespace, cfg) -> None:
@@ -413,7 +417,15 @@ def _diff_for(git_result, commits: list, with_diff: bool):
     if not with_diff or not commits:
         return None
     original = git_result.commits
-    if not original or commits[-1].hash != original[-1].hash:
+    # Both ends. Checking only the oldest meant that when noise filtering
+    # dropped HEAD, the cached diff - which runs to HEAD - was reused, so a
+    # commit deliberately excluded from the prompt and the cache key still had
+    # its code sent to the provider.
+    if (
+        not original
+        or commits[-1].hash != original[-1].hash
+        or commits[0].hash != original[0].hash
+    ):
         return gitsource.diff_for_commits(commits)
     return git_result.diff
 
@@ -427,8 +439,11 @@ def _run_onboarding(args: argparse.Namespace, cfg) -> None:
     """
     try:
         git_result = gitsource.read_recent_commits(cfg.onboard_commits, with_diff=args.with_diff)
-    except NotAGitRepo:
-        print("error: not a git repository (run voicelog from inside a git repo)", file=sys.stderr)
+    except NotAGitRepo as exc:
+        # str(exc), not a fixed string: gitsource distinguishes "git could not
+        # be run" from "this is not a repository", and telling someone whose
+        # PATH is broken to cd elsewhere sends them the wrong way.
+        print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
 
     cwd = os.getcwd()
@@ -480,6 +495,22 @@ def _run_onboarding(args: argparse.Namespace, cfg) -> None:
 
 
 def main() -> None:
+    """Entry point. Ctrl+C is an answer, not a crash.
+
+    Wrapped rather than handled inline because an interrupt can land anywhere -
+    mid-prompt, mid-request, mid-playback - and none of those deserve a
+    traceback. 130 is the conventional exit code for SIGINT, which is what a
+    shell or CI step reads. _speak keeps its own handler: there, skipping the
+    audio is the whole point and the run continues.
+    """
+    try:
+        _main()
+    except KeyboardInterrupt:
+        print(chr(10) + "interrupted.", file=sys.stderr)
+        sys.exit(130)
+
+
+def _main() -> None:
     # Casual changelogs contain em-dashes/emoji; make sure the console can show
     # them (Windows defaults to cp1252). The voice.md file is always UTF-8.
     for stream in (sys.stdout, sys.stderr):
@@ -627,8 +658,13 @@ def main() -> None:
         )
 
     # --- Load config ---
+    # Flags are the top layer of the same merge, not a second pass afterwards,
+    # so a setting means the same thing however it arrived. Applied here, before
+    # the setup gate, so `--model X` on a fresh machine just works instead of
+    # opening a wizard.
+    overrides, overrides_origin = _flag_overrides(args)
     try:
-        cfg = config_module.load(args.config)
+        cfg = config_module.load(args.config, overrides, overrides_origin)
     except ConfigFileNotFound as exc:
         print(f"error: config file not found: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -638,6 +674,12 @@ def main() -> None:
         # from the user config, which saving rewrites and which drops values it
         # cannot use. A bad value in a project's changelog.yml is untouchable by
         # the wizard, so promising a repair there would be a lie.
+        if exc.path.startswith("--"):
+            # Typed on the command line, so it is a usage error: exit 2, the
+            # convention argparse uses and scripts read. Same validator, same
+            # message, different contract.
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(2)
         user_path = config_module.user_config_path()
         repairable = bool(args.setup and user_path and exc.path == user_path)
         if not repairable:
@@ -645,7 +687,7 @@ def main() -> None:
             sys.exit(1)
         print(f"warning: ignoring an unusable setting ({exc})", file=sys.stderr)
         print("Setup will drop it.", file=sys.stderr)
-        cfg = config_module.defaults_config()
+        cfg = _defaults_with_flags(overrides, overrides_origin)
     except ConfigFileUnreadable as exc:
         # Intact, just unavailable - so unlike a corrupt file, --setup gets no
         # pass here. Rewriting it would destroy content we never managed to
@@ -665,17 +707,27 @@ def main() -> None:
         print(f"warning: ignoring unreadable config ({exc})", file=sys.stderr)
         print("Continuing with built-in defaults; setup will write a fresh config.",
               file=sys.stderr)
-        cfg = config_module.defaults_config()
-
-    # Flags sit above every file layer. Applied before the setup gate so that
-    # `--model X` on a fresh machine just works instead of opening a wizard.
-    previous_provider = cfg.provider
-    cfg = _apply_overrides(cfg, args)
+        cfg = _defaults_with_flags(overrides, overrides_origin)
 
     # A switch keeps whatever model the config named, because clearing it would
     # break `voicelog --provider groq` for everyone who has one configured. Say
     # so here, while the user can still act on it, rather than letting it
     # surface later as a rejected-model error.
+    #
+    # "Switched" means "differs from what the files alone resolve to", which is
+    # why this reloads without the flag layer. Comparing against DEFAULTS
+    # instead inverted the test: an openai config with --provider nvidia - the
+    # exact case this exists for - said nothing, while --provider openai on an
+    # openai config warned about a switch that had not happened.
+    previous_provider = cfg.provider
+    if args.provider and not args.model and cfg.model:
+        try:
+            previous_provider = config_module.load(args.config).provider
+        except (ConfigFileNotFound, ConfigFileInvalid, OSError):
+            # The flag may be what makes the config loadable at all (a typo'd
+            # provider it overrides). No baseline, so no claim about a switch.
+            previous_provider = cfg.provider
+
     if args.provider and not args.model and cfg.model and cfg.provider != previous_provider:
         print(
             f"warning: using model '{cfg.model}' from your config against "
@@ -698,7 +750,7 @@ def main() -> None:
 
     # No key set → offer to paste one (interactive terminals only).
     preset = providers.get(cfg.provider)
-    wizard.ensure_key(
+    _offer_key(
         cfg.api_key_env,
         label=cfg.provider,
         signup_url=preset.signup_url if preset else "",
@@ -744,8 +796,11 @@ def main() -> None:
     # --- Read commits ---
     try:
         git_result = gitsource.read_commits(cfg.fallback_commits, since=since, with_diff=args.with_diff)
-    except NotAGitRepo:
-        print("error: not a git repository (run voicelog from inside a git repo)", file=sys.stderr)
+    except NotAGitRepo as exc:
+        # str(exc), not a fixed string: gitsource distinguishes "git could not
+        # be run" from "this is not a repository", and telling someone whose
+        # PATH is broken to cd elsewhere sends them the wrong way.
+        print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
     except RefNotFound as exc:
         if args.pull:
@@ -804,8 +859,6 @@ def main() -> None:
         base_url=cfg.base_url,
     )
     raw_markdown = None if args.fresh else cache.get(cwd, key)
-    # A cache hit needs no write, so there is nothing that can fail.
-    cached_ok = True
 
     if raw_markdown is None:
         diff = _diff_for(git_result, commits, args.with_diff)
@@ -822,7 +875,7 @@ def main() -> None:
             print(f"warning: LLM unavailable ({exc}) — falling back to commit list", file=sys.stderr)
             _emit(render.render_fallback(commits))
             sys.exit(0)
-        cached_ok = cache.put(cwd, key, raw_markdown)
+        cache.put(cwd, key, raw_markdown)
 
     # --- Render and output (text first, always — never gated on TTS) ---
     rendered = render.render(raw_markdown)
@@ -836,7 +889,10 @@ def main() -> None:
     if (args.changelog or cfg.write_changelog) and not diff_mode:
         try:
             voicefile.update_voice_md(cwd, rendered, git_result.tag, rel_path=cfg.voice_md)
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
+            # UnicodeDecodeError (a ValueError, not an OSError) means the file
+            # on disk is not UTF-8. Rewriting it would replace whatever we
+            # could not decode, so voicefile refuses and we say so.
             print(f"warning: could not update voice.md ({exc})", file=sys.stderr)
             persisted_ok = False
 
@@ -846,17 +902,21 @@ def main() -> None:
     # Placed before the speech block because generate.summarize does not catch
     # KeyboardInterrupt, and a Ctrl+C there would skip a write placed lower -
     # leaving the user to re-read the identical range next time.
-    # cached_ok joins the gate for the same reason persisted_ok is in it: if
-    # nothing kept this generation, advancing hides it from both directions -
-    # --replay finds no cache and --since-last sees no new commits - leaving a
-    # paid summary in terminal scrollback and nowhere else. Re-generating it
-    # next run costs another call; losing it costs the call AND the text.
+    # A failed cache write deliberately does NOT hold the watermark back. It
+    # used to, on the reasoning that record_summarised writes into the same
+    # .git/voicelog directory so nothing could freeze the watermark on its own.
+    # That was directory-level reasoning applied to a file-level failure: a
+    # read-only cache.json in a writable directory fails every time while the
+    # watermark write succeeds, so the gate froze the watermark permanently and
+    # re-billed generation and summary on every subsequent run for an identical
+    # range. cache._write now repairs that case itself; when it still cannot
+    # write, the failure is permanent, and paying forever costs more than the
+    # one run's recoverability the gate was protecting. The text was printed
+    # and the warning names what was lost.
     #
-    # This does not risk a permanently frozen watermark: record_summarised
-    # writes into the same .git/voicelog directory, so anything that makes that
-    # location unwritable already stops the watermark by itself. The gate only
-    # bites when the cache file alone is unwritable, which the next run can fix.
-    if watermark_mode and persisted_ok and cached_ok:
+    # persisted_ok stays in the gate: voice.md is the accumulating changelog
+    # rather than a disposable cache, and a failure there is worth retrying.
+    if watermark_mode and persisted_ok:
         head = gitsource.head_sha()
         if head:
             state.record_summarised(head)

@@ -45,7 +45,7 @@ Your answers are saved per-machine, so **every repo you work in inherits them** 
 
 Set `VOICELOG_CONFIG_HOME` to put it somewhere else.
 
-**Your API key is never written to that file** — only the *name* of the environment variable it lives in. Setup puts the key in the current session and prints the command to keep it:
+**Your API key is never written to that file** — only the *name* of the environment variable it lives in. Setup puts the key in the current session and offers to keep it for future terminals (`setx` on Windows, an `export` line in your shell profile on macOS/Linux). Decline and it just prints the command to run yourself:
 
 ```bash
 export NVIDIA_API_KEY=nvapi-...     # bash / macOS / Linux
@@ -53,6 +53,8 @@ set NVIDIA_API_KEY=nvapi-...        # Windows cmd (this session)
 $env:NVIDIA_API_KEY = "nvapi-..."   # PowerShell (this session)
 setx NVIDIA_API_KEY "nvapi-..."     # Windows, every future terminal
 ```
+
+Keeping it has a cost worth knowing: on Windows `setx` passes the value on a command line, so it is briefly visible to other processes (and recorded if process-creation auditing is on) — voicelog says so before it runs. On macOS/Linux the key lands in a shell profile that is typically world-readable, so think twice if you keep your dotfiles in git.
 
 A free key from [build.nvidia.com](https://build.nvidia.com) needs no credit card, but any provider below works.
 
@@ -96,6 +98,11 @@ Switching provider takes that provider's endpoint and key env var with it; *rest
 the provider you already use changes nothing, so a hand-edited `base_url` survives
 `--provider nvidia`. A switch keeps whatever `model` your config names and says so —
 pass `--model` to change it too.
+
+The same rule applies wherever the name is written, not just on the command line: putting
+`provider: openai` in a config file brings OpenAI's endpoint and key variable with it, and
+anything you set yourself in that file wins over the preset. A flag and a config entry mean
+the same thing.
 
 ### Catch up on a `git pull`
 
@@ -167,7 +174,7 @@ By default, each run is a **transient rundown** — it prints the casual changel
 
 Each run:
 1. Prints the full casual changelog (under `## Unreleased`) to stdout.
-2. Reads a **short spoken summary** aloud via NVIDIA Riva TTS (2-3 sentences — not the whole changelog, so audio stays quick even on huge repos).
+2. Reads a **short spoken summary** aloud through whichever voice you configured (2-3 sentences — not the whole changelog, so audio stays quick even on huge repos). Ctrl+C during playback skips the audio; the text has already printed.
 
 Add `--changelog` (or set `write_changelog: true`) to *also* maintain a persistent release changelog at `.changelog/voice.md` that accumulates across releases (with automatic promotion when you tag). That's opt-in — most runs don't need it.
 
@@ -218,14 +225,14 @@ voicelog talks to any **OpenAI-compatible** endpoint. `voicelog --setup` offers 
 | Provider | base_url | api_key_env | Model ids |
 |----------|----------|-------------|-----------|
 | NVIDIA (default) | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` | [build.nvidia.com](https://build.nvidia.com) |
-
-Reasoning models (OpenAI's o-series, gpt-5) work too: they reject the parameters most tools send, so voicelog asks the provider what it wants and retries — no model allowlist to go stale.
 | OpenAI | `https://api.openai.com/v1` | `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com/docs/models) |
 | Groq (fast, free tier) | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | [console.groq.com](https://console.groq.com/docs/models) |
 | OpenRouter (one key, many providers) | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | [openrouter.ai/models](https://openrouter.ai/models) |
 | Ollama (local, no key) | `http://127.0.0.1:11434/v1` | *(leave blank — none needed)* | whatever you have pulled |
 
 The model column is deliberately a link rather than a value: setup reads each provider's `/v1/models` at the moment you run it, so the list is never out of date. Anything else OpenAI-compatible works too — pick "Other" and paste its base URL.
+
+Reasoning models (OpenAI's o-series, gpt-5) work too: they reject the parameters most tools send, so voicelog asks the provider what it wants and retries — no model allowlist to go stale.
 
 ## Using your own voice
 
@@ -236,6 +243,7 @@ The spoken part is just as configurable — `voicelog --setup` asks, or set `tts
 | NVIDIA Riva (default) | `riva` | `Magpie-Multilingual.EN-US.Sofia` | `NVIDIA_API_KEY` |
 | OpenAI TTS | `openai` | `alloy` (or echo/fable/onyx/nova/shimmer) | `OPENAI_API_KEY` |
 | ElevenLabs | `elevenlabs` | your ElevenLabs voice id | `ELEVENLABS_API_KEY` |
+| No voice | `none` | — | — |
 
 No key for any of them? Set `speak: false` — the text changelog still works everywhere. See the comments in `changelog.yml` for the full field list per provider (`tts_model`, `tts_base_url`, etc).
 
@@ -262,7 +270,7 @@ All fields are optional. Key ones:
 | `sections` | Section grouping for the changelog |
 | `noise` | Regex commit subjects to drop (e.g. `^wip`) |
 | `speak` | `true`/`false` — read aloud (also `--no-speak` per run) |
-| `tts_provider` | `riva` / `openai` / `elevenlabs` |
+| `tts_provider` | `riva` / `openai` / `elevenlabs` / `none` (no audio) |
 | `tts_voice` | Voice id/name — meaning depends on the provider |
 | `voice_md` | Path to the persistent changelog, relative to the repo |
 | `max_commits` | Cap on commits sent to the model for normal ranges |
